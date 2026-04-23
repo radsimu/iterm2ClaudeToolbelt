@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-code.session-manager</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Replace with the output of: which python3 -->
+        <string>/usr/bin/python3</string>
+        <!-- Replace with the actual path to claude_sessions.py -->
+        <string>/Users/YOUR_USERNAME/path/to/iterm2ClaudeToolbelt/claude_sessions.py</string>
+    </array>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-sessions.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-sessions.log</string>
+
+    <!-- Give iTerm2 time to start before the first connection attempt -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
