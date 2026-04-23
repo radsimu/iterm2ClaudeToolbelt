@@ -9,9 +9,9 @@ An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Cod
 ## Features
 
 - **Live session list** — all Claude Code sessions grouped by project, auto-refreshed every 8 seconds
-- **Active session detection** — green dot + "Focus" button for sessions currently running in iTerm2 panes; reliably detects both fresh and `--resume`d sessions
-- **Focus** — jump straight to the iTerm2 pane running that session
-- **Resume** — reopen any past session; choose to open it as a split pane, new tab, or new window
+- **Active session detection** — green dot + "Focus" button for sessions currently running anywhere in iTerm2 — split panes, tabs, or separate windows; reliably detects both fresh and `--resume`d sessions
+- **Focus** — jump straight to the iTerm2 pane running that session, regardless of which tab or window it's in
+- **Resume** — reopen any past session; choose to open it as a split pane in the current view, a new tab, or a new window
 - **Recap tooltips** — hover over any session label to see a summary of what that session was about (pulled from Claude's `away_summary`, `custom-title`, or the opening user prompt — whichever is available)
 - **Rename** — click a session label to give it a custom name
 - **Archive / Unarchive** — hide old sessions without deleting them; reveal archived sessions per project with one click
