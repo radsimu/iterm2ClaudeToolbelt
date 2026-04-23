@@ -39,6 +39,8 @@ An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Cod
 
 ## Installation
 
+> **Tip:** You can ask Claude Code to guide you through these steps. Just open a session in the cloned repo and say something like *"help me install this — find the right Python path, fill in the plist, and load the LaunchAgent"*. It handles the fiddly parts well, especially steps 4 and 5.
+
 ### 1. Clone the repo
 
 ```bash
