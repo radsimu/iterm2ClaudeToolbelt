@@ -134,7 +134,6 @@ The widget creates three small JSON files in `~/.claude/` to persist your prefer
 
 | File | Purpose |
 |------|---------|
-| `session-labels.json` | Custom names you give to sessions |
 | `session-manager-order.json` | Session and project ordering / nesting |
 | `session-manager-archive.json` | Archived session IDs |
 
@@ -152,7 +151,7 @@ rm ~/Library/LaunchAgents/com.claude-code.session-manager.plist
 Optionally remove the widget's state files:
 
 ```bash
-rm ~/.claude/session-labels.json ~/.claude/session-manager-order.json ~/.claude/session-manager-archive.json
+rm ~/.claude/session-manager-order.json ~/.claude/session-manager-archive.json
 ```
 
 ---

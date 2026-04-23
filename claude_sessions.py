@@ -23,7 +23,6 @@ PORT = 9837
 IDENTIFIER = "com.claude-code.session-manager"
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
-SESSION_LABELS_FILE = CLAUDE_DIR / "session-labels.json"
 PID_TO_SESSION_FILE = CLAUDE_DIR / "pid-to-session.json"
 SESSION_STATUS_FILE = CLAUDE_DIR / "session-status.json"
 ARCHIVE_FILE = CLAUDE_DIR / "session-manager-archive.json"
@@ -146,25 +145,23 @@ def _project_path_from_jsonl(proj_dir: Path) -> Optional[str]:
 
 
 def _session_git_info(jf: Path) -> tuple:
-    """Return (branch, cwd, computed_title) from the JSONL file.
+    """Return (branch, cwd, custom_title, recap).
 
-    Title priority: away_summary → custom-title → first user prompt.
+    custom_title: most recent custom-title entry (written by /rename or the widget).
+    recap:        away_summary → first user prompt (tooltip; custom_title excluded).
     """
-    branch, cwd, title = None, None, None
+    branch, cwd, custom_title, recap = None, None, None, None
     try:
         with jf.open("rb") as f:
             f.seek(0, 2)
             size = f.tell()
 
-            # Head: first user prompt lives here
             f.seek(0)
             head = f.read(min(size, 8192)).decode("utf-8", errors="ignore")
 
-            # Small tail: branch + cwd live near the end
             f.seek(max(0, size - 8192))
             small_tail = f.read().decode("utf-8", errors="ignore")
 
-            # Large tail: recap entries can be buried further back
             f.seek(max(0, size - 524288))
             large_tail = f.read().decode("utf-8", errors="ignore")
 
@@ -181,24 +178,27 @@ def _session_git_info(jf: Path) -> tuple:
             except json.JSONDecodeError:
                 continue
 
-        # Most recent recap: away_summary > custom-title
         for line in reversed(large_tail.splitlines()):
             line = line.strip()
             if not line:
                 continue
             try:
                 d = json.loads(line)
-                if d.get("type") == "system" and d.get("subtype") == "away_summary":
-                    title = d.get("content") or None
-                    if title:
-                        break
-                if not title and d.get("type") == "custom-title":
-                    title = d.get("customTitle") or None
+                # custom-title: accept empty string as an intentional clear
+                if custom_title is None and d.get("type") == "custom-title":
+                    ct = d.get("customTitle")
+                    if ct is not None:
+                        custom_title = ct
+                # recap: away_summary only (custom-title is now the label)
+                if not recap and d.get("type") == "system" and d.get("subtype") == "away_summary":
+                    recap = d.get("content") or None
+                if custom_title is not None and recap:
+                    break
             except json.JSONDecodeError:
                 continue
 
-        # Fallback: first user prompt from the head of the file
-        if not title:
+        # Recap fallback: first real user prompt
+        if not recap:
             for line in head.splitlines():
                 line = line.strip()
                 if not line:
@@ -219,14 +219,14 @@ def _session_git_info(jf: Path) -> tuple:
                         else:
                             text = ""
                         if text and not text.startswith("<local-command-caveat>"):
-                            title = text[:120].replace("\n", " ")
+                            recap = text[:120].replace("\n", " ")
                             break
                 except json.JSONDecodeError:
                     continue
 
     except Exception:
         pass
-    return branch, cwd, title
+    return branch, cwd, custom_title, recap
 
 
 def _abbrev_path(path: str) -> str:
@@ -389,7 +389,6 @@ def _relative_time(mtime: float) -> str:
 
 
 def build_projects() -> list:
-    labels = _read_json(SESSION_LABELS_FILE)
     status_map = _read_json(SESSION_STATUS_FILE)
     archived_set = _read_archive()
     order_data = _read_order()
@@ -421,7 +420,7 @@ def build_projects() -> list:
             except Exception:
                 continue
             tty = session_tty.get(sid, "")
-            branch, sess_cwd, computed_title = _session_git_info(jf)
+            branch, sess_cwd, custom_title, recap = _session_git_info(jf)
             is_worktree = False
             if sess_cwd:
                 try:
@@ -432,8 +431,8 @@ def build_projects() -> list:
             status = raw_status if tty else ("idle" if raw_status == "working" else raw_status)
             flat.append({
                 "id": sid,
-                "label": labels.get(sid, ""),
-                "computed_title": computed_title or "",
+                "label": custom_title or "",
+                "computed_title": recap or "",
                 "status": status,
                 "mtime": mtime,
                 "time_str": _relative_time(mtime),
@@ -633,13 +632,19 @@ class _Handler(BaseHTTPRequestHandler):
 
             elif self.path == "/api/rename":
                 sid = body.get("session_id", "")
+                enc = body.get("encoded_name", "")
                 label = body.get("label", "")
-                labels = _read_json(SESSION_LABELS_FILE)
-                if label:
-                    labels[sid] = label
-                elif sid in labels:
-                    del labels[sid]
-                self._send_json({"ok": _write_json(SESSION_LABELS_FILE, labels)})
+                ok = False
+                if sid and enc:
+                    jf = PROJECTS_DIR / enc / f"{sid}.jsonl"
+                    try:
+                        entry = json.dumps({"type": "custom-title", "customTitle": label, "sessionId": sid})
+                        with jf.open("a", encoding="utf-8") as fh:
+                            fh.write(entry + "\n")
+                        ok = True
+                    except Exception:
+                        pass
+                self._send_json({"ok": ok})
 
             elif self.path == "/api/archive":
                 sid = body.get("session_id", "")
@@ -685,10 +690,6 @@ class _Handler(BaseHTTPRequestHandler):
                     try:
                         if jf.exists():
                             jf.unlink()
-                        # Clean up labels
-                        labels = _read_json(SESSION_LABELS_FILE)
-                        labels.pop(sid, None)
-                        _write_json(SESSION_LABELS_FILE, labels)
                         # Clean up order
                         od = _read_order()
                         if enc in od:
@@ -1182,7 +1183,9 @@ function resumeEl(btn){
 
 function renEl(lbl){
   if(!lbl||lbl.tagName==='INPUT') return;
-  const sid=lbl.closest('.sess').dataset.id;
+  const sessEl=lbl.closest('.sess');
+  const sid=sessEl.dataset.id;
+  const enc=sessEl.dataset.enc;
   const cur=lbl.classList.contains('unnamed')?'':lbl.textContent;
   const inp=document.createElement('input');
   inp.className='lbl-inp';inp.value=cur;inp.placeholder='Label…';
@@ -1194,7 +1197,7 @@ function renEl(lbl){
     span.className='lbl'+(v?'':' unnamed')+(recap?' has-recap':'');span.textContent=v||'unnamed';span.onclick=()=>renEl(span);
     if(recap) span.dataset.recap=recap;
     inp.replaceWith(span);
-    await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,label:v})});
+    await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,encoded_name:enc,label:v})});
   };
   inp.onblur=commit;
   inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inp.blur();}if(e.key==='Escape'){inp.replaceWith(lbl);}};
