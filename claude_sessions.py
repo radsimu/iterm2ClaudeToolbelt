@@ -675,6 +675,34 @@ class _Handler(BaseHTTPRequestHandler):
                 od[enc] = order
                 self._send_json({"ok": _write_order(od)})
 
+            elif self.path == "/api/delete":
+                sid = body.get("session_id", "")
+                enc = body.get("encoded_name", "")
+                ok = False
+                if sid and enc:
+                    proj_dir = PROJECTS_DIR / enc
+                    jf = proj_dir / f"{sid}.jsonl"
+                    try:
+                        if jf.exists():
+                            jf.unlink()
+                        # Clean up labels
+                        labels = _read_json(SESSION_LABELS_FILE)
+                        labels.pop(sid, None)
+                        _write_json(SESSION_LABELS_FILE, labels)
+                        # Clean up order
+                        od = _read_order()
+                        if enc in od:
+                            od[enc] = _remove_from_tree(od[enc], sid)
+                        _write_order(od)
+                        # Clean up archive
+                        archived = _read_archive()
+                        archived.discard(sid)
+                        _write_archive(archived)
+                        ok = True
+                    except Exception:
+                        pass
+                self._send_json({"ok": ok})
+
             elif self.path == "/api/reorder-projects":
                 proj_order = body.get("order", [])
                 od = _read_order()
@@ -776,6 +804,15 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .btn.r{border-color:#2d4a5c;color:#9cdcfe}.btn.r:hover{background:#182430}
 .btn.arch{border-color:#3a2a2a;color:#664444}.btn.arch:hover{background:#2a1a1a;color:#cc6666}
 .btn.unarch{border-color:#2a3a2a;color:#446644}.btn.unarch:hover{background:#1a2a1a;color:#66aa66}
+.btn.del{border-color:#2a1a1a;color:#4a2a2a}.btn.del:hover{background:#2a1010;color:#cc3333;border-color:#4a2020}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10000;display:flex;align-items:center;justify-content:center}
+.modal{background:#222;border:1px solid #3a3a3a;border-radius:6px;padding:16px 18px;max-width:220px;box-shadow:0 8px 28px rgba(0,0,0,.8)}
+.modal p{font-size:11px;color:#bbb;line-height:1.5;margin-bottom:12px}
+.modal p strong{color:#ddd}
+.modal-btns{display:flex;gap:6px;justify-content:flex-end}
+.modal-btns button{font-size:11px;padding:4px 12px;border-radius:3px;cursor:pointer;border:1px solid #3a3a3a;background:transparent;color:#888}
+.modal-btns .modal-cancel:hover{background:#2a2a2a;color:#ccc}
+.modal-btns .modal-confirm{border-color:#4a2020;color:#cc3333}.modal-btns .modal-confirm:hover{background:#2a1010;color:#ff4444}
 
 .arch-row{font-size:10px;color:#555;cursor:pointer;padding:2px 4px 2px 4px;user-select:none;margin-top:2px;display:flex;align-items:center;gap:4px}
 .arch-row:hover{color:#888}
@@ -1020,7 +1057,9 @@ function makeSessEl(s, p){
   const ab=document.createElement('button');
   if(!isArch){ab.className='btn arch';ab.title='Archive';ab.textContent='⊟';ab.onclick=()=>archiveEl(ab,s.id,p.encoded_name);}
   else{ab.className='btn unarch';ab.title='Unarchive';ab.textContent='⊞';ab.onclick=()=>unarchiveEl(ab,s.id,p.encoded_name);}
-  sa.appendChild(ab);el.appendChild(sa);
+  sa.appendChild(ab);
+  const db=document.createElement('button');db.className='btn del';db.title='Delete session';db.textContent='🗑';db.onclick=()=>deleteEl(s.id,s.label||s.id.slice(0,8),p.encoded_name);sa.appendChild(db);
+  el.appendChild(sa);
 
   // children container for nesting
   const ch=document.createElement('div');ch.className='children';el.appendChild(ch);
@@ -1171,6 +1210,30 @@ async function unarchiveEl(btn,sid,enc){
   btn.disabled=true;
   await fetch('/api/unarchive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,encoded_name:enc})});
   await doLoad();
+}
+
+function showConfirm(message, onConfirm){
+  const backdrop=document.createElement('div');backdrop.className='modal-backdrop';
+  const modal=document.createElement('div');modal.className='modal';
+  const p=document.createElement('p');p.innerHTML=message;
+  const btns=document.createElement('div');btns.className='modal-btns';
+  const cancel=document.createElement('button');cancel.className='modal-cancel';cancel.textContent='Cancel';
+  const confirm=document.createElement('button');confirm.className='modal-confirm';confirm.textContent='Delete';
+  btns.append(cancel,confirm);modal.append(p,btns);backdrop.appendChild(modal);
+  document.documentElement.appendChild(backdrop);
+  const close=()=>backdrop.remove();
+  cancel.onclick=close;
+  backdrop.onclick=e=>{if(e.target===backdrop)close();};
+  confirm.onclick=()=>{close();onConfirm();};
+  confirm.focus();
+}
+
+function deleteEl(sid,label,enc){
+  const name=label.length>40?label.slice(0,40)+'…':label;
+  showConfirm(`Permanently delete <strong>${x(name)}</strong>?<br><br>This removes the JSONL file and cannot be undone.`, async()=>{
+    await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,encoded_name:enc})});
+    await doLoad();
+  });
 }
 
 doLoad();
