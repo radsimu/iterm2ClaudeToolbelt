@@ -2,7 +2,7 @@
 
 An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Code](https://claude.ai/code) sessions — across every project — without leaving your terminal.
 
-![Widget overview](screenshots/overview.png)
+![iTerm2 with 4 active Claude Code sessions and the toolbelt widget](screenshots/iterm_composite.png)
 
 ---
 
@@ -23,7 +23,9 @@ An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Cod
 - **Session status** — colour-coded dot: green = open in iTerm2, amber = working, grey = idle
 - **Dark-mode native** — designed for iTerm2's dark theme
 
-![Session tooltips and focus](screenshots/tooltip.png)
+| Widget overview | Recap tooltip on hover | Resume options |
+|---|---|---|
+| ![Widget overview](screenshots/overview.png) | ![Recap tooltip](screenshots/tooltip.png) | ![Resume options](screenshots/resume.png) |
 
 ---
 
