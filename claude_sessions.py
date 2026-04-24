@@ -7,12 +7,15 @@ import asyncio
 import datetime
 import json
 import os
+import queue
 import shlex
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Optional
 
 import iterm2
@@ -37,6 +40,20 @@ TEAMMATE_MARKER = '<teammate-message teammate_id="team-lead">'
 
 _connection: Optional[iterm2.Connection] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+# SSE: event broadcaster — iTerm2 watchers / fs watcher put into each subscriber's queue.
+_event_subscribers: list = []
+_event_sub_lock = threading.Lock()
+
+
+def _broadcast_refresh(reason: str = "event") -> None:
+    with _event_sub_lock:
+        subs = list(_event_subscribers)
+    for q in subs:
+        try:
+            q.put_nowait(reason)
+        except Exception:
+            pass
 
 
 # ── Pure-Python data layer ────────────────────────────────────────────────────
@@ -592,110 +609,54 @@ def _scan_claude_processes() -> list:
 
 
 def _get_active_session_ttys(teammate_map: Optional[dict] = None) -> dict:
-    """Return {session_id: tty} by matching running claude processes to sessions.
+    """Return {session_id: tty} for every running claude process.
 
-    Strategy, in order:
-    1. --resume <sid> in args → direct mapping.
-    2. --agent-name <a> --team-name <t> in args → look up sid via teammate_map[(t, a)].
-    3. Otherwise: find project dir via lsof and pick the most-recently-modified JSONL.
+    Strategy, in priority order:
+    1. ~/.claude/sessions/<pid>.json — Claude itself records the PID → sessionId
+       mapping for interactive launches. Authoritative and unambiguous.
+    2. --resume <sid> in args — direct mapping (covers teammates too, sometimes).
+    3. --agent-name/--team-name — look up (team, agent) → sid via teammate_map.
     """
     teammate_map = teammate_map or {}
     procs = _scan_claude_processes()
     if not procs:
         return {}
 
-    home = str(Path.home()) + "/"
-    claude_prefix = str(CLAUDE_DIR) + "/"
-
-    explicit: dict = {}   # session_id -> tty (from --resume or teammate flags)
-    pid_project: list = []  # (project_path, tty) for PIDs needing lsof fallback
+    sessions_dir = CLAUDE_DIR / "sessions"
+    result: dict = {}
 
     for pid, raw_tty, args in procs:
         tty = _normalize_tty(raw_tty or "")
+        if not tty:
+            continue
+
+        # Claude's own per-PID session file — overwritten at startup, removed at exit.
+        sf = sessions_dir / f"{pid}.json"
+        if sf.exists():
+            try:
+                sid = json.loads(sf.read_text(encoding="utf-8")).get("sessionId")
+            except Exception:
+                sid = None
+            if sid:
+                result[sid] = tty
+                continue
 
         if "--resume" in args:
             parts = args.split()
             try:
                 sid = parts[parts.index("--resume") + 1]
-                if tty:
-                    explicit[sid] = tty
+                result[sid] = tty
                 continue
             except (ValueError, IndexError):
                 pass
 
         if "--agent-name" in args and "--team-name" in args:
-            agent_name = _arg_value(args, "--agent-name")
-            team_name = _arg_value(args, "--team-name")
-            if agent_name and team_name and tty:
-                sid = teammate_map.get((team_name, agent_name))
+            agent = _arg_value(args, "--agent-name")
+            team = _arg_value(args, "--team-name")
+            if agent and team:
+                sid = teammate_map.get((team, agent))
                 if sid:
-                    explicit[sid] = tty
-                    continue
-
-        if not tty:
-            continue
-
-        try:
-            r = subprocess.run(
-                ["lsof", "-p", pid, "-Fn"], capture_output=True, text=True, timeout=3
-            )
-        except Exception:
-            continue
-        for line in r.stdout.splitlines():
-            if not line.startswith("n"):
-                continue
-            path = line[1:]
-            if (path.startswith(home)
-                    and not path.startswith(claude_prefix)
-                    and not path.startswith(home + "Library/")
-                    and not path.startswith(home + ".")
-                    and os.path.isdir(path)):
-                pid_project.append((path, tty))
-                break
-
-    result: dict = dict(explicit)
-
-    # For PIDs without --resume, map project dir → most recent JSONL.
-    # Walk projects deepest-first (by decoded-path length) and reserve each tty once,
-    # so a tty tied to a nested cwd isn't also claimed by its ancestor project dir.
-    if pid_project:
-        proj_list = []
-        for proj_dir in PROJECTS_DIR.iterdir():
-            if not proj_dir.is_dir():
-                continue
-            pp = _decode_project_path(proj_dir.name) or _project_path_from_jsonl(proj_dir)
-            if pp:
-                proj_list.append((proj_dir, pp))
-        proj_list.sort(key=lambda x: -len(x[1]))
-        used_ttys = set(result.values())
-        used_sids = set(result.keys())
-        for proj_dir, proj_path in proj_list:
-            matching_ttys = [
-                tty for pp, tty in pid_project
-                if tty not in used_ttys and (pp == proj_path or pp.startswith(proj_path + "/"))
-            ]
-            if not matching_ttys:
-                continue
-            try:
-                jsonls = sorted(
-                    [(f.stem, f.stat().st_mtime) for f in proj_dir.iterdir() if f.suffix == ".jsonl"],
-                    key=lambda x: x[1], reverse=True,
-                )
-            except Exception:
-                continue
-            # Walk JSONLs newest-first, skipping sids already claimed (by teammate map,
-            # --resume, or another project), assigning one tty per unclaimed sid.
-            tty_iter = iter(matching_ttys)
-            for sid, _ in jsonls:
-                if sid in used_sids:
-                    continue
-                try:
-                    tty = next(tty_iter)
-                except StopIteration:
-                    break
-                result[sid] = tty
-                used_sids.add(sid)
-                used_ttys.add(tty)
+                    result[sid] = tty
 
     return result
 
@@ -951,6 +912,44 @@ async def _refresh_app() -> iterm2.App:
     return await iterm2.async_get_app(_connection)
 
 
+async def _do_get_window_context() -> dict:
+    """Return {frontmost_ttys:[...], focused_tty:str} for the current iTerm2 window.
+
+    focused_tty is the tty of the active session (i.e. the split pane the user is
+    typing in). frontmost_ttys covers every session in the frontmost window.
+    """
+    app = await _refresh_app()
+    win = app.current_terminal_window
+    if not win:
+        return {"frontmost_ttys": [], "focused_tty": ""}
+    sessions = [s for t in win.tabs for s in t.sessions]
+    if not sessions:
+        return {"frontmost_ttys": [], "focused_tty": ""}
+    focused_id = None
+    try:
+        cur_tab = win.current_tab
+        cs = cur_tab.current_session if cur_tab else None
+        if cs is not None:
+            focused_id = cs.session_id
+    except Exception:
+        focused_id = None
+    ttys = await asyncio.gather(
+        *[s.async_get_variable("tty") for s in sessions],
+        return_exceptions=True,
+    )
+    focused_tty = ""
+    out: list = []
+    for s, tty in zip(sessions, ttys):
+        if isinstance(tty, Exception):
+            continue
+        norm = _normalize_tty(tty or "")
+        if norm:
+            out.append(norm)
+            if focused_id and getattr(s, "session_id", None) == focused_id:
+                focused_tty = norm
+    return {"frontmost_ttys": out, "focused_tty": focused_tty}
+
+
 async def _do_focus(tty: str) -> bool:
     norm = _normalize_tty(tty)
     if not norm:
@@ -1052,11 +1051,65 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
 
+    def _handle_sse(self) -> None:
+        q: queue.Queue = queue.Queue()
+        with _event_sub_lock:
+            _event_subscribers.append(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            # Initial ping so the client triggers its first load right away.
+            self.wfile.write(b"data: hello\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    reason = q.get(timeout=25)
+                    self.wfile.write(f"data: {reason}\n\n".encode())
+                    self.wfile.flush()
+                except queue.Empty:
+                    # Keepalive comment line prevents proxies / browsers from dropping the stream.
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with _event_sub_lock:
+                if q in _event_subscribers:
+                    _event_subscribers.remove(q)
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/", "/index.html"):
             self._send_html(MAIN_HTML)
+        elif self.path == "/api/events":
+            self._handle_sse()
         elif self.path == "/api/data":
-            self._send_json(build_projects())
+            projects = build_projects()
+            ctx = _run_iterm_op(_do_get_window_context()) or {}
+            tty_set = set(ctx.get("frontmost_ttys") or [])
+            focused_tty = ctx.get("focused_tty") or ""
+            current_sids: list = []
+            focused_sid = ""
+            def _collect(nodes):
+                nonlocal focused_sid
+                for s in nodes:
+                    t = s.get("tty") or ""
+                    if t and t in tty_set:
+                        current_sids.append(s["id"])
+                    if t and focused_tty and t == focused_tty:
+                        focused_sid = s["id"]
+                    _collect(s.get("children") or [])
+            for p in projects:
+                _collect(p.get("sessions") or [])
+                _collect(p.get("archived") or [])
+            self._send_json({
+                "projects": projects,
+                "current_window_session_ids": current_sids,
+                "focused_session_id": focused_sid,
+            })
         else:
             self.send_response(404)
             self.end_headers()
@@ -1164,8 +1217,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
 
-class _Server(HTTPServer):
+class _Server(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def _start_server() -> None:
@@ -1191,8 +1245,6 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 #probe-toggle:hover{color:#999}
 #hdr{display:flex;align-items:center;gap:6px;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #2a2a2a}
 #hdr h1{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:.5px;flex:1}
-#rbtn{background:none;border:none;color:#555;cursor:pointer;font-size:14px;padding:0;line-height:1}
-#rbtn:hover{color:#999}
 #search{width:100%;background:#222;border:1px solid #333;color:#ccc;font-size:11px;padding:4px 8px;border-radius:3px;outline:none;margin-bottom:6px}
 #search:focus{border-color:#4fc3f7}
 #search::placeholder{color:#444}
@@ -1216,7 +1268,7 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 /* nested children container */
 .children{padding-left:14px;margin-top:1px}
 
-.sess{padding:3px 4px 3px 6px;border-left:2px solid #333;margin:1px 0;border-radius:0 2px 2px 0}
+.sess{padding:3px 4px 3px 6px;border-left:2px solid #333;margin:1px 0;border-radius:0 2px 2px 0;position:relative}
 .sess:hover{background:#1e1e1e}
 .sess.open{border-left-color:#4ec9b0}
 .sess.working{border-left-color:#e6b450}
@@ -1224,6 +1276,12 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .sess.teammate:hover{background:#231b2c}
 .sess.teammate.open{border-left-color:#4ec9b0;box-shadow:inset 2px 0 #b480e6}
 .sess.teammate.working{border-left-color:#e6b450;box-shadow:inset 2px 0 #b480e6}
+.sess.focused{background:#1a2930 !important;border-left-color:#4fc3f7 !important;border-left-width:3px;padding-left:5px;box-shadow:0 0 0 1px rgba(79,195,247,.3) inset}
+.sess.focused:hover{background:#1f3040 !important}
+.sess.focused .lbl{color:#cfe8ff}
+.sess.teammate.focused{background:#2a1d3d !important;box-shadow:0 0 0 1px rgba(180,128,230,.35) inset}
+.sess.teammate.focused:hover{background:#331f4a !important}
+.sess.teammate.focused .lbl{color:#e8d9f7}
 .sess.archived-item{opacity:.5;border-left-color:#333}
 .sess.archived-item .lbl{color:#555}
 
@@ -1292,15 +1350,12 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .arch-row.open .arch-chv{transform:rotate(90deg)}
 
 #empty{text-align:center;color:#555;font-size:11px;margin-top:30px}
-.spin{display:inline-block;animation:spin .8s linear infinite}
-@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 <div id="hdr">
   <h1>⚡ Claude</h1>
   <button id="probe-toggle" onclick="toggleProbe()" title="Show iTerm2 window probe">🔍</button>
-  <button id="rbtn" onclick="doLoad()" title="Refresh"><span id="rs">↻</span></button>
 </div>
 <div id="probe" style="display:none"></div>
 <input id="search" type="text" placeholder="Filter…" oninput="render()">
@@ -1309,13 +1364,32 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
 <script>
 let data = [];
-let collapsed = new Set(JSON.parse(localStorage.getItem('cc_col')||'[]'));
+let currentSids = new Set();
+let focusedSid = '';
+// Per-tab override: projects whose collapse state the user toggled AWAY from the
+// window-context default. sessionStorage so defaults re-apply on widget reload.
+let manualCollapseToggle = new Set(JSON.parse(sessionStorage.getItem('cc_toggle')||'[]'));
 let expandedArchived = new Set();
 let isDragging = false;
 let _maxWeight = 1;
 const projSortables = {};
 let _tip = null;
 let _tipTarget = null;
+
+function projHasCurrent(p){
+  const walk = (ss) => {
+    for (const s of ss||[]) {
+      if (currentSids.has(s.id)) return true;
+      if (walk(s.children)) return true;
+    }
+    return false;
+  };
+  return walk(p.sessions);
+}
+function isProjCollapsed(enc, hasCurrent){
+  const defaultCollapsed = !hasCurrent;
+  return manualCollapseToggle.has(enc) ? !defaultCollapsed : defaultCollapsed;
+}
 
 function computeMaxWeight(projects){
   let m = 1;
@@ -1364,18 +1438,45 @@ function hideTip() { if (_tip) { _tip.remove(); _tip = null; } }
 function x(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 // ── load / refresh ────────────────────────────────────────────────────────────
+let _loadInFlight = false;
+let _loadQueued = false;
 async function doLoad(){
   if(isDragging) return;
-  document.getElementById('rs').className='spin';
+  if(_loadInFlight){ _loadQueued = true; return; }
+  _loadInFlight = true;
   try{
     const r=await fetch('/api/data');
-    data=await r.json();
+    const payload=await r.json();
+    // Payload was wrapped to carry current-window context; stay compatible with the old shape too.
+    if (Array.isArray(payload)) { data = payload; currentSids = new Set(); focusedSid = ''; }
+    else {
+      data = payload.projects || [];
+      currentSids = new Set(payload.current_window_session_ids || []);
+      focusedSid = payload.focused_session_id || '';
+    }
     render();
   }catch{
     document.getElementById('root').innerHTML='<div id="empty">Connection error</div>';
+  } finally {
+    _loadInFlight = false;
+    if (_loadQueued) { _loadQueued = false; doLoad(); }
   }
-  document.getElementById('rs').className='';
 }
+
+// Server-sent events from Python: iTerm2 focus/layout/session changes + claude start/exit.
+let _es = null;
+function connectEvents(){
+  try { if (_es) _es.close(); } catch(e){}
+  _es = new EventSource('/api/events');
+  _es.onmessage = () => doLoad();
+  _es.onerror = () => {
+    try { _es.close(); } catch(e){}
+    setTimeout(connectEvents, 3000);
+  };
+}
+connectEvents();
+// Slow safety-net poll in case the SSE stream silently stalls.
+setInterval(doLoad, 30000);
 
 let _projSortable=null;
 
@@ -1396,7 +1497,10 @@ function render(){
   const scrollY=root.scrollTop;
   root.innerHTML='';
   let any=false;
-  for(const p of data){
+  // Split: projects whose sessions include one from the frontmost window go first.
+  const cur=[], other=[];
+  for(const p of data){ (projHasCurrent(p)?cur:other).push(p); }
+  for(const p of [...cur,...other]){
     const el=buildProject(p,q);
     if(el){root.appendChild(el);any=true;}
   }
@@ -1415,27 +1519,17 @@ function render(){
       scrollSpeed:12,
       onStart:()=>{
         isDragging=true;
-        // Collapse all projects so the full list is visible for dragging
-        _preCollapseState=new Set(collapsed);
-        root.querySelectorAll('.proj:not(.collapsed)').forEach(el=>{
-          const enc=el.id.slice(1);
-          collapsed.add(enc);
-          el.classList.add('collapsed');
-        });
+        // Collapse all projects visually so the full list is draggable; don't
+        // touch the persisted toggle set — we'll just re-render after drop.
+        _preCollapseState=true;
+        root.querySelectorAll('.proj:not(.collapsed)').forEach(el=>el.classList.add('collapsed'));
       },
       onEnd:()=>{
         isDragging=false;
-        // Restore collapse state
-        if(_preCollapseState!==null){
-          root.querySelectorAll('.proj').forEach(el=>{
-            const enc=el.id.slice(1);
-            if(_preCollapseState.has(enc)) collapsed.add(enc);
-            else{ collapsed.delete(enc); el.classList.remove('collapsed'); }
-          });
-          localStorage.setItem('cc_col',JSON.stringify([...collapsed]));
-          _preCollapseState=null;
-        }
+        _preCollapseState=null;
         saveProjectOrder();
+        // Re-render to restore each project's natural collapse state.
+        render();
       },
     });
   }
@@ -1444,7 +1538,8 @@ function render(){
 // ── project element ───────────────────────────────────────────────────────────
 function buildProject(p, q){
   const enc=p.encoded_name;
-  const col=collapsed.has(enc);
+  const hasCurrent=projHasCurrent(p);
+  const col=isProjCollapsed(enc, hasCurrent);
   const archExpanded=expandedArchived.has(enc);
 
   // filter active sessions (nested)
@@ -1511,7 +1606,7 @@ function makeSessEl(s, p){
   const isArch=s.archived;
   const sc=s.is_open?'open':s.status;
   const el=document.createElement('div');
-  el.className=`sess ${sc}${isArch?' archived-item':''}${s.is_teammate?' teammate':''}`;
+  el.className=`sess ${sc}${isArch?' archived-item':''}${s.is_teammate?' teammate':''}${s.id===focusedSid?' focused':''}`;
   el.dataset.id=s.id;
   el.dataset.tty=s.tty||'';
   el.dataset.path=p.path||'';
@@ -1646,8 +1741,9 @@ async function saveOrder(projEl, enc){
 function tog(enc){
   const el=document.getElementById('P'+enc);if(!el)return;
   el.classList.toggle('collapsed');
-  collapsed.has(enc)?collapsed.delete(enc):collapsed.add(enc);
-  localStorage.setItem('cc_col',JSON.stringify([...collapsed]));
+  if(manualCollapseToggle.has(enc)) manualCollapseToggle.delete(enc);
+  else manualCollapseToggle.add(enc);
+  sessionStorage.setItem('cc_toggle',JSON.stringify([...manualCollapseToggle]));
 }
 
 function togArch(enc){
@@ -1823,14 +1919,49 @@ try {
   fetch('/api/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).catch(()=>{});
 } catch(e){}
 
-doLoad();
-setInterval(doLoad,8000);
 </script>
 </body>
 </html>"""
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+async def _watch_iterm_events() -> None:
+    """Subscribe to iTerm2 event streams; broadcast a refresh on each event."""
+    async def run(name: str, cm_factory, method: str):
+        while True:
+            try:
+                async with cm_factory() as mon:
+                    fn = getattr(mon, method)
+                    while True:
+                        await fn()
+                        _broadcast_refresh(name)
+            except Exception as exc:
+                print(f"[watch {name}] {exc!r}; retrying in 5s", file=sys.stderr)
+                await asyncio.sleep(5)
+
+    await asyncio.gather(
+        run("focus", lambda: iterm2.FocusMonitor(_connection), "async_get_next_update"),
+        run("layout", lambda: iterm2.LayoutChangeMonitor(_connection), "async_get"),
+        run("new-session", lambda: iterm2.NewSessionMonitor(_connection), "async_get"),
+        run("session-term", lambda: iterm2.SessionTerminationMonitor(_connection), "async_get"),
+    )
+
+
+def _watch_sessions_dir() -> None:
+    """Poll ~/.claude/sessions/ for additions/removals — that's how we see claude start/exit."""
+    sd = CLAUDE_DIR / "sessions"
+    prev: Optional[frozenset] = None
+    while True:
+        try:
+            cur = frozenset(os.listdir(sd)) if sd.exists() else frozenset()
+            if prev is not None and cur != prev:
+                _broadcast_refresh("sessions-dir")
+            prev = cur
+        except Exception:
+            pass
+        time.sleep(1.0)
+
 
 async def main(connection: iterm2.Connection) -> None:
     global _connection, _event_loop
@@ -1847,9 +1978,11 @@ async def main(connection: iterm2.Connection) -> None:
 
     t = threading.Thread(target=_start_server, daemon=True, name="claude-sessions-http")
     t.start()
+    threading.Thread(target=_watch_sessions_dir, daemon=True, name="claude-sessions-fs").start()
     print(f"[claude-sessions] running on port {PORT}", file=sys.stderr)
 
-    await asyncio.Event().wait()
+    # Run iTerm2 event watchers for the rest of the process lifetime.
+    await _watch_iterm_events()
 
 
 iterm2.run_forever(main, retry=True)
