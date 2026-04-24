@@ -23,10 +23,15 @@ PORT = 9837
 IDENTIFIER = "com.claude-code.session-manager"
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+TEAMS_DIR = CLAUDE_DIR / "teams"
 PID_TO_SESSION_FILE = CLAUDE_DIR / "pid-to-session.json"
 SESSION_STATUS_FILE = CLAUDE_DIR / "session-status.json"
 ARCHIVE_FILE = CLAUDE_DIR / "session-manager-archive.json"
 ORDER_FILE  = CLAUDE_DIR / "session-manager-order.json"
+TEAMS_INDEX_FILE = CLAUDE_DIR / "session-manager-teams.json"
+WEIGHTS_FILE = CLAUDE_DIR / "session-manager-weights.json"
+
+TEAMMATE_MARKER = '<teammate-message teammate_id="team-lead">'
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -82,6 +87,206 @@ def _write_order(data: dict) -> bool:
         return False
 
 
+def _read_teams_index() -> dict:
+    raw = _read_json(TEAMS_INDEX_FILE)
+    if not isinstance(raw, dict):
+        return {"scanned": {}, "team_to_leader": {}}
+    raw.setdefault("scanned", {})
+    raw.setdefault("team_to_leader", {})
+    return raw
+
+
+def _scan_jsonl_for_team_creates(jf: Path) -> list:
+    """Return list of team_names this session created via TeamCreate. Fast-path: byte search first."""
+    try:
+        raw = jf.read_bytes()
+    except Exception:
+        return []
+    # Byte-level fast check — skip expensive JSON parse if the file never mentions TeamCreate
+    if b'"TeamCreate"' not in raw:
+        return []
+    names: list = []
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    for line in text.splitlines():
+        if '"TeamCreate"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        for blk in d.get("message", {}).get("content", []) or []:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "tool_use" and blk.get("name") == "TeamCreate":
+                tname = (blk.get("input") or {}).get("team_name")
+                if tname and tname not in names:
+                    names.append(tname)
+    return names
+
+
+def _refresh_teams_index(session_files: list) -> dict:
+    """session_files: list of (sid, jsonl_path, enc, mtime, is_teammate).
+
+    Incremental: only re-scans JSONLs whose mtime changed since last scan. Teammate
+    sessions never call TeamCreate so are skipped. Active teams from ~/.claude/teams/
+    overlay at the end so live data wins.
+    """
+    idx = _read_teams_index()
+    scanned = idx["scanned"]
+    team_to_leader = idx["team_to_leader"]
+    live_sids = set()
+    changed = False
+
+    for sid, jf, enc, mtime, is_teammate in session_files:
+        live_sids.add(sid)
+        if is_teammate:
+            continue
+        prev = scanned.get(sid) or {}
+        if prev.get("mtime") == mtime and prev.get("enc") == enc:
+            continue
+        # Remove this session's old team→leader entries before rescanning
+        for t in prev.get("teams", []) or []:
+            if team_to_leader.get(t, {}).get("lead_session_id") == sid:
+                team_to_leader.pop(t, None)
+        teams = _scan_jsonl_for_team_creates(jf)
+        scanned[sid] = {"mtime": mtime, "enc": enc, "teams": teams}
+        for t in teams:
+            team_to_leader[t] = {"lead_session_id": sid, "lead_proj_enc": enc}
+        changed = True
+
+    # Drop entries for sessions that no longer exist
+    stale = [sid for sid in scanned if sid not in live_sids]
+    for sid in stale:
+        for t in scanned[sid].get("teams", []) or []:
+            if team_to_leader.get(t, {}).get("lead_session_id") == sid:
+                team_to_leader.pop(t, None)
+        scanned.pop(sid, None)
+        changed = True
+
+    # Overlay active team configs (authoritative while teams are alive)
+    if TEAMS_DIR.exists():
+        try:
+            for td in TEAMS_DIR.iterdir():
+                if not td.is_dir():
+                    continue
+                cfg = td / "config.json"
+                if not cfg.exists():
+                    continue
+                try:
+                    data = json.loads(cfg.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                tname = data.get("name") or td.name
+                lsid = data.get("leadSessionId")
+                if not (tname and lsid):
+                    continue
+                prev = team_to_leader.get(tname, {})
+                if prev.get("lead_session_id") != lsid:
+                    # Resolve enc from the scanned index (leader was scanned as a JSONL)
+                    enc = (scanned.get(lsid) or {}).get("enc", "")
+                    team_to_leader[tname] = {"lead_session_id": lsid, "lead_proj_enc": enc}
+                    changed = True
+        except Exception:
+            pass
+
+    if changed:
+        _write_json(TEAMS_INDEX_FILE, idx)
+    return team_to_leader
+
+
+def _refresh_weights_index(session_files: list) -> dict:
+    """session_files: list of (sid, jsonl_path, mtime). Returns {sid: weight_dict}.
+
+    Incremental: for each session, scan only bytes after last_offset. If the file
+    shrunk (truncation or replacement), reset and rescan. Writes cache back to
+    WEIGHTS_FILE when anything changed.
+    """
+    raw = _read_json(WEIGHTS_FILE)
+    cache = raw if isinstance(raw, dict) else {}
+    live_sids = set()
+    changed = False
+
+    for sid, jf, mtime in session_files:
+        live_sids.add(sid)
+        try:
+            size = jf.stat().st_size
+        except Exception:
+            continue
+        prev = cache.get(sid) or {}
+        if prev.get("mtime") == mtime and prev.get("size") == size:
+            continue
+
+        start_offset = prev.get("last_offset", 0)
+        output_tokens = prev.get("output_tokens", 0)
+        max_input_tokens = prev.get("max_input_tokens", 0)
+        compactions = prev.get("compactions", 0)
+
+        # If the file is smaller than our last offset, it was truncated/replaced — restart.
+        if size < start_offset:
+            start_offset = 0
+            output_tokens = 0
+            max_input_tokens = 0
+            compactions = 0
+
+        try:
+            with jf.open("rb") as fh:
+                fh.seek(start_offset)
+                # Read only the new portion
+                data = fh.read(size - start_offset)
+        except Exception:
+            continue
+
+        if data:
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = d.get("type")
+                if t == "compact_boundary" or d.get("subtype") == "compact_boundary":
+                    compactions += 1
+                u = (d.get("message") or {}).get("usage") or {}
+                if u:
+                    output_tokens += int(u.get("output_tokens") or 0)
+                    itok = (int(u.get("input_tokens") or 0)
+                            + int(u.get("cache_read_input_tokens") or 0)
+                            + int(u.get("cache_creation_input_tokens") or 0))
+                    if itok > max_input_tokens:
+                        max_input_tokens = itok
+
+        cache[sid] = {
+            "mtime": mtime,
+            "size": size,
+            "last_offset": size,
+            "output_tokens": output_tokens,
+            "max_input_tokens": max_input_tokens,
+            "compactions": compactions,
+        }
+        changed = True
+
+    # Drop entries for sessions that no longer exist
+    stale = [sid for sid in list(cache) if sid not in live_sids]
+    for sid in stale:
+        cache.pop(sid, None)
+        changed = True
+
+    if changed:
+        _write_json(WEIGHTS_FILE, cache)
+    return cache
+
+
 def _ids_in_order(nodes) -> set:
     ids: set = set()
     for node in nodes:
@@ -118,6 +323,24 @@ def _remove_from_tree(nodes, sid) -> list:
     return result
 
 
+def _insert_as_child(nodes, parent_sid, child_sid):
+    """Return a new tree with child_sid inserted as first child under parent_sid."""
+    out = []
+    for node in nodes:
+        if isinstance(node, str):
+            if node == parent_sid:
+                out.append({"id": node, "children": [child_sid]})
+            else:
+                out.append(node)
+        else:
+            children = node.get("children") or []
+            if node["id"] == parent_sid:
+                out.append({**node, "children": [child_sid] + list(children)})
+            else:
+                out.append({**node, "children": _insert_as_child(children, parent_sid, child_sid)})
+    return out
+
+
 def _project_path_from_jsonl(proj_dir: Path) -> Optional[str]:
     """Scan JSONL files (oldest first) for a cwd entry — that's the launch directory."""
     try:
@@ -144,20 +367,24 @@ def _project_path_from_jsonl(proj_dir: Path) -> Optional[str]:
     return None
 
 
-def _session_git_info(jf: Path) -> tuple:
-    """Return (branch, cwd, custom_title, recap).
+def _session_git_info(jf: Path) -> dict:
+    """Return dict: branch, cwd, custom_title, recap, team_name, agent_name, is_teammate.
 
     custom_title: most recent custom-title entry (written by /rename or the widget).
     recap:        away_summary → first user prompt (tooltip; custom_title excluded).
+    is_teammate:  first real user message starts with the teammate-message wrapper.
+    team_name/agent_name: pulled from the teammate's own JSONL records (present on every message).
     """
-    branch, cwd, custom_title, recap = None, None, None, None
+    branch = cwd = custom_title = recap = None
+    team_name = agent_name = None
+    is_teammate = False
     try:
         with jf.open("rb") as f:
             f.seek(0, 2)
             size = f.tell()
 
             f.seek(0)
-            head = f.read(min(size, 8192)).decode("utf-8", errors="ignore")
+            head = f.read(min(size, 16384)).decode("utf-8", errors="ignore")
 
             f.seek(max(0, size - 8192))
             small_tail = f.read().decode("utf-8", errors="ignore")
@@ -197,36 +424,78 @@ def _session_git_info(jf: Path) -> tuple:
             except json.JSONDecodeError:
                 continue
 
-        # Recap fallback: first real user prompt
-        if not recap:
+        # First-pass over head: find first real user prompt + detect teammate + grab team/agent names
+        for line in head.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") == "user":
+                content = d.get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    text = content.strip()
+                elif isinstance(content, list):
+                    text = next(
+                        (c.get("text", "").strip() for c in content
+                         if isinstance(c, dict) and c.get("type") == "text"
+                         and c.get("text", "").strip()),
+                        "",
+                    )
+                else:
+                    text = ""
+                if text and not text.startswith("<local-command-caveat>"):
+                    if text.startswith(TEAMMATE_MARKER):
+                        is_teammate = True
+                    if not recap:
+                        snippet = text
+                        if is_teammate:
+                            # Strip the wrapper so the tooltip shows the actual task
+                            snippet = snippet[len(TEAMMATE_MARKER):].lstrip()
+                            end = snippet.find("</teammate-message>")
+                            if end != -1:
+                                snippet = snippet[:end].strip()
+                        recap = snippet[:200].replace("\n", " ")
+                    # Only need the first real user message
+                    if is_teammate or recap:
+                        pass  # continue to also collect team_name/agent_name below
+                    break
+            # teamName/agentName sit on user/assistant records
+            if team_name is None and d.get("teamName"):
+                team_name = d.get("teamName")
+            if agent_name is None and d.get("agentName"):
+                agent_name = d.get("agentName")
+
+        # Second pass if we didn't get team_name/agent_name yet — scan a bit further
+        if is_teammate and (not team_name or not agent_name):
             for line in head.splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     d = json.loads(line)
-                    if d.get("type") == "user":
-                        content = d.get("message", {}).get("content", "")
-                        if isinstance(content, str):
-                            text = content.strip()
-                        elif isinstance(content, list):
-                            text = next(
-                                (c.get("text", "").strip() for c in content
-                                 if isinstance(c, dict) and c.get("type") == "text"
-                                 and c.get("text", "").strip()),
-                                "",
-                            )
-                        else:
-                            text = ""
-                        if text and not text.startswith("<local-command-caveat>"):
-                            recap = text[:120].replace("\n", " ")
-                            break
                 except json.JSONDecodeError:
                     continue
+                if team_name is None and d.get("teamName"):
+                    team_name = d.get("teamName")
+                if agent_name is None and d.get("agentName"):
+                    agent_name = d.get("agentName")
+                if team_name and agent_name:
+                    break
 
     except Exception:
         pass
-    return branch, cwd, custom_title, recap
+    return {
+        "branch": branch,
+        "cwd": cwd,
+        "custom_title": custom_title,
+        "recap": recap,
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "is_teammate": is_teammate,
+    }
 
 
 def _abbrev_path(path: str) -> str:
@@ -241,60 +510,109 @@ def _abbrev_path(path: str) -> str:
 
 
 def _decode_project_path(encoded: str) -> Optional[str]:
-    """Resolve encoded dir name (/-replaced-with-) to a real filesystem path."""
+    """Resolve encoded dir name to a real filesystem path.
+
+    Claude encodes `/`, `.`, and ` ` all as `-`. Reversing is ambiguous on the
+    plain string, so we walk the filesystem: at each level, look for a real
+    subdir whose encoded basename matches a prefix of the remaining parts.
+    Greedy-longest wins on ties.
+    """
     if not encoded.startswith("-"):
         return None
     parts = encoded[1:].split("-")
     current = "/"
     remaining = list(parts)
     while remaining:
-        matched = False
-        # Try longest-first greedy match against actual filesystem
-        for length in range(len(remaining), 0, -1):
-            candidate = "-".join(remaining[:length])
-            candidate_path = os.path.join(current, candidate)
-            if os.path.isdir(candidate_path):
-                current = candidate_path
-                remaining = remaining[length:]
-                matched = True
-                break
-        if not matched:
+        try:
+            entries = os.listdir(current)
+        except Exception:
             return None
+        best_consumed = 0
+        best_entry = None
+        for entry in entries:
+            entry_path = os.path.join(current, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            enc = entry.replace(".", "-").replace(" ", "-").replace("/", "-")
+            enc_parts = enc.split("-")
+            n = len(enc_parts)
+            if n > len(remaining) or n <= best_consumed:
+                continue
+            if remaining[:n] == enc_parts:
+                best_consumed = n
+                best_entry = entry
+        if best_entry is None:
+            return None
+        current = os.path.join(current, best_entry)
+        remaining = remaining[best_consumed:]
     return current if current != "/" else None
 
 
-def _get_active_session_ttys() -> dict:
+def _arg_value(args: str, flag: str) -> Optional[str]:
+    """Extract the value following --flag in a command-line args string."""
+    parts = args.split()
+    try:
+        idx = parts.index(flag)
+    except ValueError:
+        return None
+    return parts[idx + 1] if idx + 1 < len(parts) else None
+
+
+def _scan_claude_processes() -> list:
+    """Return list of (pid, tty_raw, args_str) for every claude CLI or teammate process."""
+    try:
+        r = subprocess.run(
+            ["ps", "-axo", "pid=,tty=,command="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, args = parts
+        # Skip ourselves
+        if "claude_sessions" in args:
+            continue
+        first = args.split()[0] if args else ""
+        base = os.path.basename(first)
+        is_claude = (
+            base == "claude"
+            or "/.local/share/claude/versions/" in first
+            or "/claude.app/Contents/MacOS/claude" in first
+        )
+        if is_claude:
+            out.append((pid, tty, args))
+    return out
+
+
+def _get_active_session_ttys(teammate_map: Optional[dict] = None) -> dict:
     """Return {session_id: tty} by matching running claude processes to sessions.
 
-    Strategy:
-    1. If process was started with --resume <session-id>, use that directly.
-    2. Otherwise, find the project dir via lsof and pick the most-recently-modified JSONL.
+    Strategy, in order:
+    1. --resume <sid> in args → direct mapping.
+    2. --agent-name <a> --team-name <t> in args → look up sid via teammate_map[(t, a)].
+    3. Otherwise: find project dir via lsof and pick the most-recently-modified JSONL.
     """
-    try:
-        pids = subprocess.run(
-            ["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=2
-        ).stdout.split()
-    except Exception:
-        return {}
-    if not pids:
+    teammate_map = teammate_map or {}
+    procs = _scan_claude_processes()
+    if not procs:
         return {}
 
     home = str(Path.home()) + "/"
     claude_prefix = str(CLAUDE_DIR) + "/"
 
-    explicit: dict = {}   # session_id -> tty (from --resume args)
-    pid_project: list = []  # (project_path, tty) for PIDs without --resume
+    explicit: dict = {}   # session_id -> tty (from --resume or teammate flags)
+    pid_project: list = []  # (project_path, tty) for PIDs needing lsof fallback
 
-    for pid in pids:
-        tty = _normalize_tty(_pid_tty(pid) or "")
+    for pid, raw_tty, args in procs:
+        tty = _normalize_tty(raw_tty or "")
 
-        # Check if started with --resume <session-id>
-        try:
-            args = subprocess.run(
-                ["ps", "-o", "args=", "-p", pid], capture_output=True, text=True, timeout=1
-            ).stdout.strip()
-        except Exception:
-            args = ""
         if "--resume" in args:
             parts = args.split()
             try:
@@ -304,6 +622,15 @@ def _get_active_session_ttys() -> dict:
                 continue
             except (ValueError, IndexError):
                 pass
+
+        if "--agent-name" in args and "--team-name" in args:
+            agent_name = _arg_value(args, "--agent-name")
+            team_name = _arg_value(args, "--team-name")
+            if agent_name and team_name and tty:
+                sid = teammate_map.get((team_name, agent_name))
+                if sid:
+                    explicit[sid] = tty
+                    continue
 
         if not tty:
             continue
@@ -328,17 +655,24 @@ def _get_active_session_ttys() -> dict:
 
     result: dict = dict(explicit)
 
-    # For PIDs without --resume, map project dir → most recent JSONL
+    # For PIDs without --resume, map project dir → most recent JSONL.
+    # Walk projects deepest-first (by decoded-path length) and reserve each tty once,
+    # so a tty tied to a nested cwd isn't also claimed by its ancestor project dir.
     if pid_project:
+        proj_list = []
         for proj_dir in PROJECTS_DIR.iterdir():
             if not proj_dir.is_dir():
                 continue
-            proj_path = _decode_project_path(proj_dir.name)
-            if not proj_path:
-                continue
+            pp = _decode_project_path(proj_dir.name) or _project_path_from_jsonl(proj_dir)
+            if pp:
+                proj_list.append((proj_dir, pp))
+        proj_list.sort(key=lambda x: -len(x[1]))
+        used_ttys = set(result.values())
+        used_sids = set(result.keys())
+        for proj_dir, proj_path in proj_list:
             matching_ttys = [
                 tty for pp, tty in pid_project
-                if pp == proj_path or pp.startswith(proj_path + "/")
+                if tty not in used_ttys and (pp == proj_path or pp.startswith(proj_path + "/"))
             ]
             if not matching_ttys:
                 continue
@@ -349,10 +683,19 @@ def _get_active_session_ttys() -> dict:
                 )
             except Exception:
                 continue
-            # Assign one TTY per JSONL (top N most recent, where N = number of matching PIDs)
-            for i, (sid, _) in enumerate(jsonls[:len(matching_ttys)]):
-                if sid not in result:
-                    result[sid] = matching_ttys[i]
+            # Walk JSONLs newest-first, skipping sids already claimed (by teammate map,
+            # --resume, or another project), assigning one tty per unclaimed sid.
+            tty_iter = iter(matching_ttys)
+            for sid, _ in jsonls:
+                if sid in used_sids:
+                    continue
+                try:
+                    tty = next(tty_iter)
+                except StopIteration:
+                    break
+                result[sid] = tty
+                used_sids.add(sid)
+                used_ttys.add(tty)
 
     return result
 
@@ -394,12 +737,14 @@ def build_projects() -> list:
     order_data = _read_order()
     order_changed = False
 
-    session_tty = _get_active_session_ttys()
-
     projects: list = []
     if not PROJECTS_DIR.exists():
         return projects
 
+    # Phase 1 — collect flat session data for every project.
+    phase1: list = []  # [(enc, project_path, jsonl_files, flat), ...]
+    session_index_input: list = []  # for _refresh_teams_index
+    weight_input: list = []  # (sid, jf, mtime) for _refresh_weights_index
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
@@ -419,8 +764,14 @@ def build_projects() -> list:
                 mtime = jf.stat().st_mtime
             except Exception:
                 continue
-            tty = session_tty.get(sid, "")
-            branch, sess_cwd, custom_title, recap = _session_git_info(jf)
+            info = _session_git_info(jf)
+            branch = info["branch"]
+            sess_cwd = info["cwd"]
+            custom_title = info["custom_title"]
+            recap = info["recap"]
+            is_teammate = info["is_teammate"]
+            team_name = info["team_name"] or ""
+            agent_name = info["agent_name"] or ""
             is_worktree = False
             if sess_cwd:
                 try:
@@ -428,43 +779,130 @@ def build_projects() -> list:
                 except Exception:
                     pass
             raw_status = status_map.get(sid, "unknown")
-            status = raw_status if tty else ("idle" if raw_status == "working" else raw_status)
+            default_label = agent_name if (is_teammate and agent_name) else ""
             flat.append({
                 "id": sid,
                 "label": custom_title or "",
+                "default_label": default_label,
                 "computed_title": recap or "",
-                "status": status,
+                "_raw_status": raw_status,
+                "status": raw_status,
                 "mtime": mtime,
                 "time_str": _relative_time(mtime),
-                "is_open": bool(tty),
-                "tty": tty,
+                "is_open": False,
+                "tty": "",
                 "archived": sid in archived_set,
                 "branch": branch or "",
                 "is_worktree": is_worktree,
+                "is_teammate": is_teammate,
+                "team_name": team_name,
+                "agent_name": agent_name,
+                "leader_session_id": "",
+                "leader_proj_enc": "",
+                "output_tokens": 0,
+                "max_input_tokens": 0,
+                "compactions": 0,
                 "children": [],
             })
+            session_index_input.append((sid, jf, proj_dir.name, mtime, is_teammate))
+            weight_input.append((sid, jf, mtime))
 
         if not flat:
             continue
+        phase1.append((proj_dir.name, project_path, flat))
 
-        enc = proj_dir.name
+    # Phase 2 — resolve team → leader and attach to teammate sessions.
+    team_to_leader = _refresh_teams_index(session_index_input)
+    weights = _refresh_weights_index(weight_input)
+    for _, _, flat in phase1:
+        for s in flat:
+            w = weights.get(s["id"]) or {}
+            s["output_tokens"] = int(w.get("output_tokens") or 0)
+            s["max_input_tokens"] = int(w.get("max_input_tokens") or 0)
+            s["compactions"] = int(w.get("compactions") or 0)
+
+    # Teammate map (team_name, agent_name) → most-recent sid. Used by process scanner
+    # to pin a running teammate process directly to its session without mtime heuristics.
+    teammate_map: dict = {}
+    teammate_mtime: dict = {}
+    for _, _, flat in phase1:
+        for s in flat:
+            if s["is_teammate"] and s["team_name"] and s["agent_name"]:
+                key = (s["team_name"], s["agent_name"])
+                if s["mtime"] > teammate_mtime.get(key, 0):
+                    teammate_mtime[key] = s["mtime"]
+                    teammate_map[key] = s["id"]
+
+    # Phase 2b — scan live claude processes and apply tty/status to each session.
+    session_tty = _get_active_session_ttys(teammate_map)
+    for _, _, flat in phase1:
+        for s in flat:
+            tty = session_tty.get(s["id"], "")
+            s["tty"] = tty
+            s["is_open"] = bool(tty)
+            raw_status = s.pop("_raw_status", "unknown")
+            s["status"] = raw_status if tty else ("idle" if raw_status == "working" else raw_status)
+    all_session_ids = {sid for _, _, flat in phase1 for sid in (s["id"] for s in flat)}
+    for _, _, flat in phase1:
+        for s in flat:
+            if s["is_teammate"] and s["team_name"]:
+                entry = team_to_leader.get(s["team_name"])
+                if entry and entry.get("lead_session_id") in all_session_ids:
+                    s["leader_session_id"] = entry["lead_session_id"]
+                    s["leader_proj_enc"] = entry.get("lead_proj_enc", "")
+
+    # One-time migration: pull existing top-level teammates under their same-project leader.
+    migrate_teammates = order_data.get("__teammate_migration__") != 1
+
+    # Phase 3 — build per-project trees; auto-nest new teammates under same-project leader.
+    for enc, project_path, flat in phase1:
         active_map = {s["id"]: s for s in flat if not s["archived"]}
         archived_list = sorted([s for s in flat if s["archived"]], key=lambda s: s["mtime"], reverse=True)
 
         order_tree = order_data.get(enc, [])
+
+        if migrate_teammates:
+            # Move top-level teammates under same-project leader (anywhere in tree).
+            tree_ids = _ids_in_order(order_tree)
+            top_level_ids = {node if isinstance(node, str) else node["id"] for node in order_tree}
+            moved = False
+            for sid in list(top_level_ids):
+                s = active_map.get(sid)
+                if not s or not s["is_teammate"]:
+                    continue
+                leader_sid = s["leader_session_id"] if s["leader_proj_enc"] == enc else ""
+                if not leader_sid or leader_sid not in tree_ids or leader_sid == sid:
+                    continue
+                order_tree = _remove_from_tree(order_tree, sid)
+                order_tree = _insert_as_child(order_tree, leader_sid, sid)
+                moved = True
+            if moved:
+                order_data[enc] = order_tree
+                order_changed = True
+
         known = _ids_in_order(order_tree)
-        # New active sessions not yet in order file → prepend at top
         new_ids = [sid for sid in sorted(active_map, key=lambda sid: active_map[sid]["mtime"], reverse=True)
                    if sid not in known]
+        # Insert non-teammates first so that teammates can find their leader in the tree.
+        non_tm_new = [sid for sid in new_ids if not active_map[sid]["is_teammate"]]
+        tm_new = [sid for sid in new_ids if active_map[sid]["is_teammate"]]
+        for sid in non_tm_new:
+            order_tree = [sid] + order_tree
+        for sid in tm_new:
+            s = active_map[sid]
+            leader_sid = s["leader_session_id"] if s["leader_proj_enc"] == enc else ""
+            if leader_sid and leader_sid in _ids_in_order(order_tree):
+                order_tree = _insert_as_child(order_tree, leader_sid, sid)
+            else:
+                order_tree = [sid] + order_tree
         if new_ids:
-            order_tree = new_ids + order_tree
             order_data[enc] = order_tree
             order_changed = True
 
         active_tree = _build_tree(order_tree, active_map)
         last_active = max(s["mtime"] for s in flat)
 
-        display = Path(project_path).name if project_path else proj_dir.name
+        display = Path(project_path).name if project_path else enc
         projects.append({
             "encoded_name": enc,
             "path": project_path,
@@ -475,6 +913,10 @@ def build_projects() -> list:
             "last_active": last_active,
             "has_open": any(s["is_open"] for s in flat if not s["archived"]),
         })
+
+    if migrate_teammates:
+        order_data["__teammate_migration__"] = 1
+        order_changed = True
 
     # Project order: stored as __project_order__ in the order file
     proj_order = order_data.get("__project_order__", [])
@@ -710,6 +1152,11 @@ class _Handler(BaseHTTPRequestHandler):
                 od["__project_order__"] = proj_order
                 self._send_json({"ok": _write_order(od)})
 
+            elif self.path == "/api/probe":
+                # Log what the WebView can see, to help identify iTerm2 window context
+                print(f"[probe] {json.dumps(body)[:4000]}", file=sys.stderr, flush=True)
+                self._send_json({"ok": True})
+
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -736,6 +1183,12 @@ MAIN_HTML = r"""<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:8px;overflow:hidden;display:flex;flex-direction:column;height:100vh}
 #root{flex:1;overflow-y:auto;overflow-x:hidden}
+#probe{font:10px/1.3 Menlo,monospace;color:#888;background:#181818;border:1px solid #333;border-radius:3px;padding:4px 6px;margin-bottom:6px;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+#probe .k{color:#9cdcfe}
+#probe .v{color:#ce9178}
+#probe .hit{color:#e48faa;font-weight:700}
+#probe-toggle{background:none;border:none;color:#555;font-size:10px;cursor:pointer;padding:0 4px}
+#probe-toggle:hover{color:#999}
 #hdr{display:flex;align-items:center;gap:6px;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #2a2a2a}
 #hdr h1{font-size:11px;font-weight:600;color:#666;text-transform:uppercase;letter-spacing:.5px;flex:1}
 #rbtn{background:none;border:none;color:#555;cursor:pointer;font-size:14px;padding:0;line-height:1}
@@ -767,8 +1220,16 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .sess:hover{background:#1e1e1e}
 .sess.open{border-left-color:#4ec9b0}
 .sess.working{border-left-color:#e6b450}
+.sess.teammate{border-left-color:#b480e6;border-left-width:2px;background:#1d1724}
+.sess.teammate:hover{background:#231b2c}
+.sess.teammate.open{border-left-color:#4ec9b0;box-shadow:inset 2px 0 #b480e6}
+.sess.teammate.working{border-left-color:#e6b450;box-shadow:inset 2px 0 #b480e6}
 .sess.archived-item{opacity:.5;border-left-color:#333}
 .sess.archived-item .lbl{color:#555}
+
+.lbl.teammate-default{color:#b480e6;font-style:normal}
+.team-badge{font-size:9px;color:#b480e6;background:#231a2c;border:1px solid #3a2b4a;padding:0 4px;border-radius:2px;flex-shrink:0;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.team-badge.remote{color:#8a6cb0;border-style:dashed}
 
 /* drag handle */
 .dh{cursor:grab;color:#4a4a4a;font-size:11px;flex-shrink:0;padding:0 3px 0 0;user-select:none;line-height:1}
@@ -796,6 +1257,12 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .lbl-inp{flex:1;background:#222;border:1px solid #4fc3f7;color:#ccc;font-size:11px;padding:0 4px;border-radius:2px;outline:none}
 
 .smeta{font-size:10px;color:#5a5a5a;margin:1px 0 2px;padding-left:14px;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.weight-bar{display:inline-block;width:52px;height:8px;background:#222;border:1px solid #2f2f2f;border-radius:3px;overflow:hidden;vertical-align:middle;flex-shrink:0}
+.weight-fill{display:block;height:100%;background:#3a5f58;border-radius:2px;transition:width .2s;box-shadow:0 0 4px rgba(78,201,176,.15) inset}
+.weight-fill.w-med{background:linear-gradient(90deg,#3a8f80,#4ec9b0)}
+.weight-fill.w-hi{background:linear-gradient(90deg,#4ec9b0,#e6b450);box-shadow:0 0 6px rgba(230,180,80,.25) inset}
+.weight-fill.w-xxl{background:linear-gradient(90deg,#e6b450,#e48faa);box-shadow:0 0 8px rgba(228,143,170,.35) inset}
+.compact-mark{font-size:10px;color:#c97ca0;flex-shrink:0;font-weight:600}
 .branch{font-size:10px;color:#569cd6;background:#1a2530;border:1px solid #1e3a50;padding:0 4px;border-radius:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .worktree{font-size:9px;color:#888;background:#252525;border:1px solid #333;padding:0 4px;border-radius:2px;flex-shrink:0}
 .sa{display:flex;gap:3px;flex-wrap:wrap;padding-left:14px}
@@ -832,8 +1299,10 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 <body>
 <div id="hdr">
   <h1>⚡ Claude</h1>
+  <button id="probe-toggle" onclick="toggleProbe()" title="Show iTerm2 window probe">🔍</button>
   <button id="rbtn" onclick="doLoad()" title="Refresh"><span id="rs">↻</span></button>
 </div>
+<div id="probe" style="display:none"></div>
 <input id="search" type="text" placeholder="Filter…" oninput="render()">
 <div id="root">Loading…</div>
 
@@ -843,9 +1312,19 @@ let data = [];
 let collapsed = new Set(JSON.parse(localStorage.getItem('cc_col')||'[]'));
 let expandedArchived = new Set();
 let isDragging = false;
+let _maxWeight = 1;
 const projSortables = {};
 let _tip = null;
 let _tipTarget = null;
+
+function computeMaxWeight(projects){
+  let m = 1;
+  const walk = (ss) => { for (const s of ss||[]) { if ((s.output_tokens||0) > m) m = s.output_tokens; walk(s.children); } };
+  for (const p of projects||[]) { walk(p.sessions); walk(p.archived); }
+  return m;
+}
+
+function fmtInt(n){ if(!n) return '0'; if(n>=1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M'; if(n>=1e3) return (n/1e3).toFixed(1).replace(/\.0$/,'')+'k'; return String(n); }
 
 // Document-level delegation — more reliable than per-element listeners in WKWebView
 document.addEventListener('mouseover', e => {
@@ -911,6 +1390,7 @@ function render(){
   if(isDragging) return;
   Object.keys(projSortables).forEach(e=>destroySortables(e));
   if(_projSortable){_projSortable.destroy();_projSortable=null;}
+  _maxWeight=computeMaxWeight(data);
   const q=document.getElementById('search').value.toLowerCase();
   const root=document.getElementById('root');
   const scrollY=root.scrollTop;
@@ -1031,7 +1511,7 @@ function makeSessEl(s, p){
   const isArch=s.archived;
   const sc=s.is_open?'open':s.status;
   const el=document.createElement('div');
-  el.className=`sess ${sc}${isArch?' archived-item':''}`;
+  el.className=`sess ${sc}${isArch?' archived-item':''}${s.is_teammate?' teammate':''}`;
   el.dataset.id=s.id;
   el.dataset.tty=s.tty||'';
   el.dataset.path=p.path||'';
@@ -1041,13 +1521,39 @@ function makeSessEl(s, p){
   const sr=document.createElement('div');sr.className='sr';
   const dh=document.createElement('span');dh.className='dh';dh.title='Drag to reorder';dh.textContent='⠿';
   const dot=document.createElement('span');dot.className=`dot ${s.is_open?'open':s.status}`;dot.title=s.is_open?'Open in iTerm2':s.status;
-  const lbl=document.createElement('span');lbl.className='lbl'+(s.label?'':' unnamed')+(s.computed_title?' has-recap':'');lbl.textContent=s.label||'unnamed';lbl.onclick=()=>renEl(lbl);
+  const lbl=document.createElement('span');
+  const displayLabel=s.label||s.default_label||'unnamed';
+  const usingDefault=!s.label&&!!s.default_label;
+  lbl.className='lbl'+(s.label?'':' unnamed')+(usingDefault?' teammate-default':'')+(s.computed_title?' has-recap':'');
+  lbl.textContent=displayLabel;lbl.onclick=()=>renEl(lbl);
   if(s.computed_title){lbl.dataset.recap=s.computed_title;}
+  if(s.default_label){lbl.dataset.default=s.default_label;}
   sr.append(dh,dot,lbl);el.appendChild(sr);
 
   // meta
   const sm=document.createElement('div');sm.className='smeta';
-  sm.innerHTML=`<span>${s.time_str}</span>${s.branch&&s.branch!=='HEAD'?`<span class="branch" title="${x(s.branch)}">${x(s.branch)}</span>`:''}${s.is_worktree?'<span class="worktree">worktree</span>':''}`;
+  let teamBadge='';
+  if(s.is_teammate&&s.team_name){
+    const remote=s.leader_proj_enc&&s.leader_proj_enc!==p.encoded_name;
+    const tip=remote?`Team "${s.team_name}" — leader in another project`:`Team: ${s.team_name}`;
+    teamBadge=`<span class="team-badge${remote?' remote':''}" title="${x(tip)}">⇌ ${x(s.team_name)}</span>`;
+  }
+  let weightBar='';
+  const w=s.output_tokens||0;
+  if(w>0||s.compactions>0){
+    const frac=Math.min(1, Math.log(1+w)/Math.log(1+Math.max(_maxWeight,2)));
+    const pct=Math.max(4, Math.round(frac*100));
+    let cls='';
+    if(frac>=0.9) cls=' w-xxl';
+    else if(frac>=0.6) cls=' w-hi';
+    else if(frac>=0.3) cls=' w-med';
+    const tip=`${fmtInt(w)} output tokens · peak ${fmtInt(s.max_input_tokens||0)} input · ${s.compactions||0} compaction${s.compactions===1?'':'s'}`;
+    weightBar=`<span class="weight-bar" title="${x(tip)}"><span class="weight-fill${cls}" style="width:${pct}%"></span></span>`;
+    if(s.compactions>0){
+      weightBar+=`<span class="compact-mark" title="${s.compactions} compaction${s.compactions===1?'':'s'}">↺${s.compactions}</span>`;
+    }
+  }
+  sm.innerHTML=`<span>${s.time_str}</span>${weightBar}${teamBadge}${s.branch&&s.branch!=='HEAD'?`<span class="branch" title="${x(s.branch)}">${x(s.branch)}</span>`:''}${s.is_worktree?'<span class="worktree">worktree</span>':''}`;
   el.appendChild(sm);
 
   // actions
@@ -1072,7 +1578,8 @@ function filterTree(sessions, q, projName){
   if(!q) return sessions;
   return sessions.flatMap(s=>{
     const kids=filterTree(s.children||[],q,'');
-    const match=(s.label||'').toLowerCase().includes(q)||projName.toLowerCase().includes(q)||s.id.startsWith(q);
+    const hay=[(s.label||''),(s.default_label||''),(s.team_name||''),(s.agent_name||''),projName].join(' ').toLowerCase();
+    const match=hay.includes(q)||s.id.startsWith(q);
     if(!match&&!kids.length) return [];
     return [{...s,children:kids}];
   });
@@ -1194,8 +1701,13 @@ function renEl(lbl){
     const v=inp.value.trim();
     const span=document.createElement('span');
     const recap=lbl.dataset.recap||'';
-    span.className='lbl'+(v?'':' unnamed')+(recap?' has-recap':'');span.textContent=v||'unnamed';span.onclick=()=>renEl(span);
+    const def=lbl.dataset.default||'';
+    const usingDefault=!v&&!!def;
+    span.className='lbl'+(v?'':' unnamed')+(usingDefault?' teammate-default':'')+(recap?' has-recap':'');
+    span.textContent=v||def||'unnamed';
+    span.onclick=()=>renEl(span);
     if(recap) span.dataset.recap=recap;
+    if(def) span.dataset.default=def;
     inp.replaceWith(span);
     await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,encoded_name:enc,label:v})});
   };
@@ -1238,6 +1750,78 @@ function deleteEl(sid,label,enc){
     await doLoad();
   });
 }
+
+// ── iTerm2 window probe ──────────────────────────────────────────────────────
+function runProbe(){
+  const out = {};
+  try { out.href = location.href; } catch(e){ out.href_err = String(e); }
+  try { out.ua = navigator.userAgent; } catch(e){}
+  try { out.referrer = document.referrer; } catch(e){}
+  try {
+    out.viewport = {w: innerWidth, h: innerHeight, ow: outerWidth, oh: outerHeight};
+    out.screen = {w: screen.width, h: screen.height, x: screen.availLeft, y: screen.availTop};
+    out.position = {x: screenX, y: screenY};
+    out.pixelRatio = devicePixelRatio;
+  } catch(e){}
+  // Probe WebKit message handlers (how WKWebView hosts expose bridges)
+  try {
+    const wk = window.webkit && window.webkit.messageHandlers;
+    out.webkit_handlers = wk ? Object.keys(wk) : null;
+  } catch(e){ out.webkit_err = String(e); }
+  // Known iTerm2 bridge candidates — just check presence
+  const candidates = ['iTerm2','iterm2','ITerm','iTerm','iTerm2Protocol','iTermToolbelt','iTermWebView','_iTerm','__iterm2','iTermID','iterm2SessionId'];
+  const found = {};
+  for (const name of candidates){
+    try { if (window[name] !== undefined) found[name] = typeof window[name]; } catch(e){}
+  }
+  out.iterm_globals = found;
+  // Enumerate non-standard globals (anything not in a baseline browser)
+  const baseline = new Set(['window','self','document','navigator','location','history','screen','console','localStorage','sessionStorage','caches','crypto','performance','indexedDB','fetch','Request','Response','Headers','Blob','File','FileReader','URL','URLSearchParams','TextEncoder','TextDecoder','setTimeout','setInterval','clearTimeout','clearInterval','requestAnimationFrame','cancelAnimationFrame','addEventListener','removeEventListener','alert','confirm','prompt','getComputedStyle','matchMedia','atob','btoa','structuredClone','queueMicrotask','Promise','Proxy','Reflect','Symbol','Map','Set','WeakMap','WeakSet','Array','Object','String','Number','Boolean','Date','Math','JSON','RegExp','Error','TypeError','RangeError','SyntaxError','ReferenceError','URIError','EvalError','Function','Iterator','Intl','WeakRef','FinalizationRegistry','BigInt','ArrayBuffer','Int8Array','Uint8Array','Uint8ClampedArray','Int16Array','Uint16Array','Int32Array','Uint32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array','DataView','SharedArrayBuffer','Atomics','Notification','AbortController','AbortSignal','Event','EventTarget','CustomEvent','MessageEvent','PopStateEvent','HashChangeEvent','KeyboardEvent','MouseEvent','PointerEvent','TouchEvent','WheelEvent','Element','HTMLElement','HTMLDocument','HTMLCollection','NodeList','Node','Text','Comment','DocumentFragment','Attr','NamedNodeMap','Range','Selection','CSS','CSSStyleDeclaration','CSSStyleSheet','CSSRule','MutationObserver','IntersectionObserver','ResizeObserver','PerformanceObserver','WebSocket','XMLHttpRequest','FormData','Worker','SharedWorker','Crypto','SubtleCrypto','DOMException','DOMParser','XMLSerializer','Image','Audio','Video','HTMLImageElement','HTMLCanvasElement','HTMLAudioElement','HTMLVideoElement','CanvasRenderingContext2D','WebGLRenderingContext','WebGL2RenderingContext','OffscreenCanvas','Path2D','BroadcastChannel','Clipboard','ClipboardItem','FontFace','FontFaceSet','CustomElementRegistry','ShadowRoot','Storage','StorageEvent','Animation','AnimationEffect','KeyframeEffect','AnimationTimeline','DocumentTimeline']);
+  const extras = [];
+  try {
+    for (const k of Object.keys(window)){
+      if (!baseline.has(k) && !k.startsWith('webkit') && !/^[A-Z]/.test(k)){
+        extras.push(k);
+      }
+    }
+  } catch(e){ out.keys_err = String(e); }
+  out.non_standard_globals = extras.slice(0, 80);
+  return out;
+}
+
+let _probeResult = null;
+function renderProbe(){
+  const el = document.getElementById('probe');
+  if (!_probeResult) { el.textContent = 'probing…'; return; }
+  const p = _probeResult;
+  const lines = [];
+  const hitKeys = Object.keys(p.iterm_globals || {});
+  lines.push(`<span class="${hitKeys.length?'hit':''}">iterm_globals: ${x(JSON.stringify(p.iterm_globals))}</span>`);
+  lines.push(`<span class="${p.webkit_handlers&&p.webkit_handlers.length?'hit':''}">webkit_handlers: ${x(JSON.stringify(p.webkit_handlers))}</span>`);
+  lines.push(`<span class="k">href</span>: ${x(String(p.href||''))}`);
+  lines.push(`<span class="k">referrer</span>: ${x(String(p.referrer||''))}`);
+  lines.push(`<span class="k">ua</span>: ${x(String(p.ua||'').slice(0,120))}`);
+  lines.push(`<span class="k">viewport</span>: ${x(JSON.stringify(p.viewport||{}))}`);
+  lines.push(`<span class="k">screenPos</span>: ${x(JSON.stringify(p.position||{}))} on ${x(JSON.stringify(p.screen||{}))}`);
+  lines.push(`<span class="k">non_standard_globals</span> (${(p.non_standard_globals||[]).length}): ${x((p.non_standard_globals||[]).join(', '))}`);
+  el.innerHTML = lines.join('<br>');
+}
+function toggleProbe(){
+  const el = document.getElementById('probe');
+  const show = el.style.display === 'none';
+  el.style.display = show ? '' : 'none';
+  if (show){
+    _probeResult = runProbe();
+    renderProbe();
+    fetch('/api/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_probeResult)}).catch(()=>{});
+  }
+}
+
+// Auto-run probe once on load so the server log captures it
+try {
+  const p = runProbe();
+  fetch('/api/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).catch(()=>{});
+} catch(e){}
 
 doLoad();
 setInterval(doLoad,8000);
