@@ -45,6 +45,10 @@ _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _event_subscribers: list = []
 _event_sub_lock = threading.Lock()
 
+# Cache: (path_str, mtime) → _session_git_info result dict
+# Keyed by mtime so it's automatically invalidated when the file changes.
+_git_info_cache: dict = {}
+
 
 def _broadcast_refresh(reason: str = "event") -> None:
     with _event_sub_lock:
@@ -391,7 +395,18 @@ def _session_git_info(jf: Path) -> dict:
     recap:        away_summary → first user prompt (tooltip; custom_title excluded).
     is_teammate:  first real user message starts with the teammate-message wrapper.
     team_name/agent_name: pulled from the teammate's own JSONL records (present on every message).
+
+    Result is cached by mtime — the file is only re-read when it has changed.
     """
+    try:
+        mtime = jf.stat().st_mtime
+    except Exception:
+        mtime = None
+
+    key = (str(jf), mtime)
+    if key in _git_info_cache:
+        return _git_info_cache[key]
+
     branch = cwd = custom_title = recap = None
     team_name = agent_name = None
     is_teammate = False
@@ -504,7 +519,8 @@ def _session_git_info(jf: Path) -> dict:
 
     except Exception:
         pass
-    return {
+
+    result = {
         "branch": branch,
         "cwd": cwd,
         "custom_title": custom_title,
@@ -513,6 +529,12 @@ def _session_git_info(jf: Path) -> dict:
         "agent_name": agent_name,
         "is_teammate": is_teammate,
     }
+    if mtime is not None:
+        _git_info_cache[key] = result
+        # Evict stale entries for the same path (previous mtime values)
+        for k in [k for k in _git_info_cache if k[0] == str(jf) and k[1] != mtime]:
+            del _git_info_cache[k]
+    return result
 
 
 def _abbrev_path(path: str) -> str:
