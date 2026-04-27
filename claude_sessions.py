@@ -410,6 +410,7 @@ def _session_git_info(jf: Path) -> dict:
     branch = cwd = custom_title = recap = None
     team_name = agent_name = None
     is_teammate = False
+    working = False
     try:
         with jf.open("rb") as f:
             f.seek(0, 2)
@@ -424,18 +425,43 @@ def _session_git_info(jf: Path) -> dict:
             f.seek(max(0, size - 524288))
             large_tail = f.read().decode("utf-8", errors="ignore")
 
+        # Capture branch/cwd from a small recent slice (cheap).
         for line in reversed(small_tail.splitlines()):
             line = line.strip()
             if not line:
                 continue
             try:
                 d = json.loads(line)
-                if not branch and d.get("gitBranch") and d.get("cwd"):
-                    branch, cwd = d["gitBranch"], d["cwd"]
-                    if branch:
-                        break
             except json.JSONDecodeError:
                 continue
+            if d.get("gitBranch") and d.get("cwd"):
+                branch, cwd = d["gitBranch"], d["cwd"]
+                break
+
+        # Activity classification scans large_tail (512KB) — small_tail can fall
+        # entirely inside a single huge tool_use record, hiding the real signal.
+        _meta_types = {
+            "system", "custom-title", "permission-mode", "file-history-snapshot",
+            "queue-operation", "last-prompt", "agent-name", "pr-link", "attachment",
+        }
+        for line in reversed(large_tail.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if not t or t in _meta_types:
+                continue
+            if t == "assistant":
+                stop = (d.get("message") or {}).get("stop_reason")
+                working = stop not in ("end_turn", "stop_sequence", None)
+            elif t == "user":
+                # Model is about to respond (real user input or tool_result).
+                working = True
+            break
 
         for line in reversed(large_tail.splitlines()):
             line = line.strip()
@@ -528,6 +554,7 @@ def _session_git_info(jf: Path) -> dict:
         "team_name": team_name,
         "agent_name": agent_name,
         "is_teammate": is_teammate,
+        "working": working,
     }
     if mtime is not None:
         _git_info_cache[key] = result
@@ -715,7 +742,6 @@ def _relative_time(mtime: float) -> str:
 
 
 def build_projects() -> list:
-    status_map = _read_json(SESSION_STATUS_FILE)
     archived_set = _read_archive()
     order_data = _read_order()
     order_changed = False
@@ -755,21 +781,21 @@ def build_projects() -> list:
             is_teammate = info["is_teammate"]
             team_name = info["team_name"] or ""
             agent_name = info["agent_name"] or ""
+            working = bool(info.get("working"))
             is_worktree = False
             if sess_cwd:
                 try:
                     is_worktree = Path(sess_cwd, ".git").is_file()
                 except Exception:
                     pass
-            raw_status = status_map.get(sid, "unknown")
             default_label = agent_name if (is_teammate and agent_name) else ""
             flat.append({
                 "id": sid,
                 "label": custom_title or "",
                 "default_label": default_label,
                 "computed_title": recap or "",
-                "_raw_status": raw_status,
-                "status": raw_status,
+                "_working_jsonl": working,
+                "status": "idle",
                 "mtime": mtime,
                 "time_str": _relative_time(mtime),
                 "is_open": False,
@@ -817,14 +843,21 @@ def build_projects() -> list:
                     teammate_map[key] = s["id"]
 
     # Phase 2b — scan live claude processes and apply tty/status to each session.
+    # Status: "inactive" (no claude process), "working" (something pending in JSONL),
+    # or "idle" (process alive, last assistant turn ended).
     session_tty = _get_active_session_ttys(teammate_map)
     for _, _, flat in phase1:
         for s in flat:
             tty = session_tty.get(s["id"], "")
             s["tty"] = tty
             s["is_open"] = bool(tty)
-            raw_status = s.pop("_raw_status", "unknown")
-            s["status"] = raw_status if tty else ("idle" if raw_status == "working" else raw_status)
+            jsonl_working = s.pop("_working_jsonl", False)
+            if not tty:
+                s["status"] = "inactive"
+            elif jsonl_working:
+                s["status"] = "working"
+            else:
+                s["status"] = "idle"
     all_session_ids = {sid for _, _, flat in phase1 for sid in (s["id"] for s in flat)}
     for _, _, flat in phase1:
         for s in flat:
@@ -1325,9 +1358,9 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 
 .sr{display:flex;align-items:center;gap:4px}
 .dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
-.dot.open{background:#4ec9b0}
-.dot.working{background:#e6b450}
-.dot.idle,.dot.unknown{background:#4a4a4a}
+.dot.open,.dot.idle{background:#4ec9b0}
+.dot.inactive,.dot.unknown{background:#4a4a4a}
+.spinner{display:inline-block;width:9px;font-family:Menlo,Monaco,monospace;font-size:12px;line-height:1;color:#e6b450;text-align:center;flex-shrink:0}
 
 .lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;cursor:pointer}
 .lbl:hover{color:#fff}
@@ -1388,6 +1421,15 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 let data = [];
 let currentSids = new Set();
 let focusedSid = '';
+
+// Braille spinner — animated locally so the bar doesn't refetch every 80ms.
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+let _spinFrame = 0;
+setInterval(() => {
+  _spinFrame = (_spinFrame + 1) % SPINNER_FRAMES.length;
+  const ch = SPINNER_FRAMES[_spinFrame];
+  document.querySelectorAll('.spinner').forEach(el => { el.textContent = ch; });
+}, 80);
 // Per-tab override: projects whose collapse state the user toggled AWAY from the
 // window-context default. sessionStorage so defaults re-apply on widget reload.
 let manualCollapseToggle = new Set(JSON.parse(sessionStorage.getItem('cc_toggle')||'[]'));
@@ -1637,7 +1679,17 @@ function makeSessEl(s, p){
   // sr row
   const sr=document.createElement('div');sr.className='sr';
   const dh=document.createElement('span');dh.className='dh';dh.title='Drag to reorder';dh.textContent='⠿';
-  const dot=document.createElement('span');dot.className=`dot ${s.is_open?'open':s.status}`;dot.title=s.is_open?'Open in iTerm2':s.status;
+  let dot;
+  if (s.status === 'working') {
+    dot = document.createElement('span');
+    dot.className = 'spinner';
+    dot.title = 'Working';
+    dot.textContent = SPINNER_FRAMES[0];
+  } else {
+    dot = document.createElement('span');
+    dot.className = `dot ${s.status}`;
+    dot.title = s.status === 'idle' ? 'Idle' : 'Inactive';
+  }
   const lbl=document.createElement('span');
   const displayLabel=s.label||s.default_label||'unnamed';
   const usingDefault=!s.label&&!!s.default_label;
@@ -1985,6 +2037,48 @@ def _watch_sessions_dir() -> None:
         time.sleep(1.0)
 
 
+def _watch_active_jsonls() -> None:
+    """Poll JSONL mtimes for currently-active sessions; broadcast on any change.
+
+    This is what flips a session between idle/working in real time. Only the
+    active set (PIDs in ~/.claude/sessions/) is polled, so cost stays trivial.
+    """
+    sd = CLAUDE_DIR / "sessions"
+    last: dict = {}
+    while True:
+        try:
+            current: dict = {}
+            sids: list = []
+            if sd.exists():
+                for pf in sd.iterdir():
+                    if pf.suffix != ".json":
+                        continue
+                    try:
+                        sid = json.loads(pf.read_text(encoding="utf-8")).get("sessionId")
+                    except Exception:
+                        sid = None
+                    if sid:
+                        sids.append(sid)
+            for sid in sids:
+                # Linear scan of project dirs is fine — there are <30 of them.
+                for pd in PROJECTS_DIR.iterdir():
+                    if not pd.is_dir():
+                        continue
+                    jf = pd / f"{sid}.jsonl"
+                    if jf.exists():
+                        try:
+                            current[sid] = jf.stat().st_mtime
+                        except Exception:
+                            pass
+                        break
+            if last and (current != last):
+                _broadcast_refresh("jsonl")
+            last = current
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+
 async def main(connection: iterm2.Connection) -> None:
     global _connection, _event_loop
     _connection = connection
@@ -2001,6 +2095,7 @@ async def main(connection: iterm2.Connection) -> None:
     t = threading.Thread(target=_start_server, daemon=True, name="claude-sessions-http")
     t.start()
     threading.Thread(target=_watch_sessions_dir, daemon=True, name="claude-sessions-fs").start()
+    threading.Thread(target=_watch_active_jsonls, daemon=True, name="claude-sessions-jsonl").start()
     print(f"[claude-sessions] running on port {PORT}", file=sys.stderr)
 
     # Run iTerm2 event watchers for the rest of the process lifetime.
