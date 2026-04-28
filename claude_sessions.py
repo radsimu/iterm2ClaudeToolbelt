@@ -416,8 +416,12 @@ def _session_git_info(jf: Path) -> dict:
             f.seek(0, 2)
             size = f.tell()
 
+            # Read enough from the start that we'll usually catch the first user
+            # message. Some sessions (subagent / hook-launched ones) prepend
+            # huge queue-operation records and push the first user record well
+            # past 16KB.
             f.seek(0)
-            head = f.read(min(size, 16384)).decode("utf-8", errors="ignore")
+            head = f.read(min(size, 524288)).decode("utf-8", errors="ignore")
 
             f.seek(max(0, size - 8192))
             small_tail = f.read().decode("utf-8", errors="ignore")
@@ -444,6 +448,18 @@ def _session_git_info(jf: Path) -> dict:
             "system", "custom-title", "permission-mode", "file-history-snapshot",
             "queue-operation", "last-prompt", "agent-name", "pr-link", "attachment",
         }
+        # Wrappers that show up as `type:"user"` records but are harness-injected
+        # notifications, not actual user input the model has to answer.
+        _systemy_user_prefixes = (
+            "<system-reminder>",
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+            "<local-command-stderr>",
+            "<command-name>",
+            "<command-message>",
+            "<command-stdout>",
+            "<command-stderr>",
+        )
         for line in reversed(large_tail.splitlines()):
             line = line.strip()
             if not line:
@@ -458,9 +474,30 @@ def _session_git_info(jf: Path) -> dict:
             if t == "assistant":
                 stop = (d.get("message") or {}).get("stop_reason")
                 working = stop not in ("end_turn", "stop_sequence", None)
-            elif t == "user":
-                # Model is about to respond (real user input or tool_result).
+                break
+            if t == "user":
+                content = (d.get("message") or {}).get("content")
+                # tool_result → model is mid-turn, definitely working
+                if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                ):
+                    working = True
+                    break
+                # Extract text portion, if any
+                txt = ""
+                if isinstance(content, str):
+                    txt = content
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            txt = b.get("text") or ""
+                            break
+                # Pure harness-injected wrapper → keep walking back
+                if txt.startswith(_systemy_user_prefixes):
+                    continue
                 working = True
+                break
             break
 
         for line in reversed(large_tail.splitlines()):
@@ -504,7 +541,18 @@ def _session_git_info(jf: Path) -> dict:
                     )
                 else:
                     text = ""
-                if text and not text.startswith("<local-command-caveat>"):
+                # Skip slash-command echoes / system caveats / harness reminders — those aren't real prompts.
+                _skip_prefixes = (
+                    "<system-reminder>",
+                    "<local-command-caveat>",
+                    "<local-command-stdout>",
+                    "<local-command-stderr>",
+                    "<command-name>",
+                    "<command-message>",
+                    "<command-stdout>",
+                    "<command-stderr>",
+                )
+                if text and not text.startswith(_skip_prefixes):
                     if text.startswith(TEAMMATE_MARKER):
                         is_teammate = True
                     if not recap:
@@ -573,6 +621,11 @@ def _abbrev_path(path: str) -> str:
     if len(parts) > 4:
         return "/".join(parts[:2]) + "/…/" + "/".join(parts[-2:])
     return path
+
+
+def _encode_project_path(path: str) -> str:
+    """Inverse of _decode_project_path. Claude maps `/`, `.`, and ` ` all to `-`."""
+    return path.replace("/", "-").replace(".", "-").replace(" ", "-")
 
 
 def _decode_project_path(encoded: str) -> Optional[str]:
@@ -788,7 +841,21 @@ def build_projects() -> list:
                     is_worktree = Path(sess_cwd, ".git").is_file()
                 except Exception:
                     pass
-            default_label = agent_name if (is_teammate and agent_name) else ""
+            # Fallback label when the user hasn't named the session.
+            # Teammates → agentName. Everyone else → truncated away_summary or
+            # first user prompt (already captured in `recap`).
+            default_label = ""
+            if is_teammate and agent_name:
+                default_label = agent_name
+            elif recap:
+                snippet = recap.strip().replace("\n", " ")
+                if len(snippet) > 60:
+                    cut = snippet[:60]
+                    sp = cut.rfind(" ")
+                    if sp > 30:
+                        cut = cut[:sp]
+                    snippet = cut + "…"
+                default_label = snippet
             flat.append({
                 "id": sid,
                 "label": custom_title or "",
@@ -819,6 +886,59 @@ def build_projects() -> list:
         if not flat:
             continue
         phase1.append((proj_dir.name, project_path, flat))
+
+    # Phase 1b — surface freshly-started sessions that haven't written a JSONL yet
+    # (e.g. a brand new claude pane, or `--fork-session` before its first message).
+    # We discover them via ~/.claude/sessions/<pid>.json (Claude writes this at startup)
+    # and synthesize a placeholder entry under the matching project.
+    sessions_dir = CLAUDE_DIR / "sessions"
+    if sessions_dir.exists():
+        known_sids: set = {s["id"] for _, _, fl in phase1 for s in fl}
+        enc_to_idx = {enc: i for i, (enc, _, _) in enumerate(phase1)}
+        for pf in sessions_dir.iterdir():
+            if pf.suffix != ".json":
+                continue
+            try:
+                pdata = json.loads(pf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            sid = pdata.get("sessionId")
+            cwd = pdata.get("cwd")
+            if not sid or not cwd or sid in known_sids:
+                continue
+            target_enc = _encode_project_path(cwd)
+            idx = enc_to_idx.get(target_enc)
+            if idx is None:
+                continue
+            mtime = (pdata.get("startedAt") or 0) / 1000.0 or time.time()
+            jf_stub = PROJECTS_DIR / target_enc / f"{sid}.jsonl"
+            phase1[idx][2].append({
+                "id": sid,
+                "label": "",
+                "default_label": pdata.get("name") or "starting…",
+                "computed_title": "",
+                "_working_jsonl": False,
+                "status": "idle",
+                "mtime": mtime,
+                "time_str": _relative_time(mtime),
+                "is_open": False,
+                "tty": "",
+                "archived": False,
+                "branch": "",
+                "is_worktree": False,
+                "is_teammate": False,
+                "team_name": "",
+                "agent_name": "",
+                "leader_session_id": "",
+                "leader_proj_enc": "",
+                "output_tokens": 0,
+                "max_input_tokens": 0,
+                "compactions": 0,
+                "children": [],
+            })
+            known_sids.add(sid)
+            session_index_input.append((sid, jf_stub, target_enc, mtime, False))
+            weight_input.append((sid, jf_stub, mtime))
 
     # Phase 2 — resolve team → leader and attach to teammate sessions.
     team_to_leader = _refresh_teams_index(session_index_input)
@@ -1341,6 +1461,7 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .sess.archived-item .lbl{color:#555}
 
 .lbl.teammate-default{color:#b480e6;font-style:normal}
+.lbl.auto-default{color:#9aa0a6;font-style:italic}
 .team-badge{font-size:9px;color:#b480e6;background:#231a2c;border:1px solid #3a2b4a;padding:0 4px;border-radius:2px;flex-shrink:0;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .team-badge.remote{color:#8a6cb0;border-style:dashed}
 
@@ -1693,7 +1814,12 @@ function makeSessEl(s, p){
   const lbl=document.createElement('span');
   const displayLabel=s.label||s.default_label||'unnamed';
   const usingDefault=!s.label&&!!s.default_label;
-  lbl.className='lbl'+(s.label?'':' unnamed')+(usingDefault?' teammate-default':'')+(s.computed_title?' has-recap':'');
+  const showsUnnamed=!s.label&&!s.default_label;
+  let cls='lbl';
+  if (showsUnnamed) cls += ' unnamed';
+  if (usingDefault) cls += s.is_teammate ? ' teammate-default' : ' auto-default';
+  if (s.computed_title) cls += ' has-recap';
+  lbl.className=cls;
   lbl.textContent=displayLabel;lbl.onclick=()=>renEl(lbl);
   if(s.computed_title){lbl.dataset.recap=s.computed_title;}
   if(s.default_label){lbl.dataset.default=s.default_label;}
@@ -1873,7 +1999,13 @@ function renEl(lbl){
     const recap=lbl.dataset.recap||'';
     const def=lbl.dataset.default||'';
     const usingDefault=!v&&!!def;
-    span.className='lbl'+(v?'':' unnamed')+(usingDefault?' teammate-default':'')+(recap?' has-recap':'');
+    const showsUnnamed=!v&&!def;
+    const isTeammate=sessEl.classList.contains('teammate');
+    let cls='lbl';
+    if (showsUnnamed) cls += ' unnamed';
+    if (usingDefault) cls += isTeammate ? ' teammate-default' : ' auto-default';
+    if (recap) cls += ' has-recap';
+    span.className=cls;
     span.textContent=v||def||'unnamed';
     span.onclick=()=>renEl(span);
     if(recap) span.dataset.recap=recap;
