@@ -948,7 +948,7 @@ def build_projects() -> list:
             phase1[idx][2].append({
                 "id": sid,
                 "label": "",
-                "default_label": pdata.get("name") or "starting…",
+                "default_label": pdata.get("name") or "",
                 "computed_title": "",
                 "_working_jsonl": False,
                 "status": "idle",

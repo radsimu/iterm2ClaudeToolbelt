@@ -108,6 +108,24 @@ The widget appears in the right-hand toolbelt panel.
 
 ---
 
+## Optional: install the bundled Claude Code skills
+
+The repo also ships a small `/fork-split` skill (forks the current Claude Code conversation into a new iTerm2 split pane, mirroring teammate-spawn layout — and, if the toolbelt is installed, auto-nests the new session under its parent in the widget tree).
+
+`install-skills.sh` symlinks each skill / hook from this repo into `~/.claude/`, so a future `git pull` updates the installed copy in place — no rebuild step.
+
+```bash
+./install-skills.sh                  # install
+./install-skills.sh --auto-update    # also install a daily `git pull` LaunchAgent (04:30 local)
+./install-skills.sh --uninstall      # remove the symlinks (and the LaunchAgent)
+```
+
+The script will print the optional one-line `~/.claude/settings.json` snippet for wiring the `/fork-split` prompt-interceptor hook (skips a Claude turn when you invoke the skill).
+
+`/fork-split` requires `python3` with `iterm2` on `$PATH`. If you need a specific interpreter, set `CLAUDE_FORK_SPLIT_PYTHON=/path/to/python3` in your shell profile.
+
+---
+
 ## Permissions
 
 The widget runs a local HTTP server on `127.0.0.1:9837` (loopback only — not accessible from the network). It reads files under `~/.claude/` (your Claude Code session data) and calls the iTerm2 Python API to focus/create panes.
