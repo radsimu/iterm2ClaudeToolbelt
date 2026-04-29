@@ -12,10 +12,15 @@ fi
 
 NAME=$(echo "$MSG" | sed 's|^/fork-split[[:space:]]*||')
 
+# Plugin install path: Claude exports CLAUDE_PLUGIN_ROOT.
+# Manual symlink install: fall back to the conventional ~/.claude location.
+RUN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/skills/fork-split/run.sh}"
+RUN="${RUN:-$HOME/.claude/skills/fork-split/run.sh}"
+
 if [[ -n "$NAME" ]]; then
-  ~/.claude/skills/fork-split/run.sh "$NAME"
+  "$RUN" "$NAME"
 else
-  ~/.claude/skills/fork-split/run.sh
+  "$RUN"
 fi
 
 # Exit 2 blocks the message from Claude — no turn, no Stop hooks

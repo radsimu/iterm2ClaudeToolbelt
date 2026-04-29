@@ -7,10 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <!-- Replace with the output of: which python3 -->
-        <string>/usr/bin/python3</string>
-        <!-- Replace with the actual path to claude_sessions.py -->
-        <string>/Users/YOUR_USERNAME/path/to/iterm2ClaudeToolbelt/claude_sessions.py</string>
+        <string>/Users/radu.simionescu/.pyenv/versions/3.14.0/bin/python3</string>
+        <string>/Users/radu.simionescu/work/iterm2ClaudeToolbelt/claude_sessions.py</string>
     </array>
 
     <key>KeepAlive</key>

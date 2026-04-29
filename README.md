@@ -108,21 +108,42 @@ The widget appears in the right-hand toolbelt panel.
 
 ---
 
-## Optional: install the bundled Claude Code skills
+## Optional: install the bundled `/fork-split` skill
 
-The repo also ships a small `/fork-split` skill (forks the current Claude Code conversation into a new iTerm2 split pane, mirroring teammate-spawn layout — and, if the toolbelt is installed, auto-nests the new session under its parent in the widget tree).
+The repo also ships a small Claude Code skill, `/fork-split`, that forks the current conversation into a new iTerm2 split pane (mirroring teammate-spawn layout). If the toolbelt is installed, the fork is auto-nested under its parent in the widget tree.
 
-`install-skills.sh` symlinks each skill / hook from this repo into `~/.claude/`, so a future `git pull` updates the installed copy in place — no rebuild step.
+This repo doubles as a Claude Code marketplace, so the skill installs and updates through Claude's native `/plugin` system — no symlinks, no `git pull` cron, no settings.json hacks. Inside any Claude Code session:
 
-```bash
-./install-skills.sh                  # install
-./install-skills.sh --auto-update    # also install a daily `git pull` LaunchAgent (04:30 local)
-./install-skills.sh --uninstall      # remove the symlinks (and the LaunchAgent)
+```
+/plugin marketplace add radsimu/iterm2ClaudeToolbelt
+/plugin install fork-split@iterm2-claude-toolbelt
 ```
 
-The script will print the optional one-line `~/.claude/settings.json` snippet for wiring the `/fork-split` prompt-interceptor hook (skips a Claude turn when you invoke the skill).
+The marketplace entry tracks `main` and Claude Code refreshes it automatically. Updates land next time you start a session.
 
-`/fork-split` requires `python3` with `iterm2` on `$PATH`. If you need a specific interpreter, set `CLAUDE_FORK_SPLIT_PYTHON=/path/to/python3` in your shell profile.
+`/fork-split` requires `python3` with `iterm2` installed (`pip install iterm2`). To pin a specific interpreter, set `CLAUDE_FORK_SPLIT_PYTHON=/path/to/python3` in your shell profile.
+
+To uninstall:
+
+```
+/plugin uninstall fork-split@iterm2-claude-toolbelt
+/plugin marketplace remove iterm2-claude-toolbelt
+```
+
+<details>
+<summary>Manual / advanced install (symlinks instead of plugin)</summary>
+
+If you'd rather keep the skill as editable symlinks pointing into a local clone of the repo (handy when you're hacking on it):
+
+```bash
+./install-skills.sh                  # symlink skills + hooks into ~/.claude/
+./install-skills.sh --auto-update    # also install a daily `git pull` LaunchAgent
+./install-skills.sh --uninstall
+```
+
+You'll need to wire the optional `UserPromptSubmit` interceptor by hand — the script prints the snippet to add to `~/.claude/settings.json`.
+
+</details>
 
 ---
 

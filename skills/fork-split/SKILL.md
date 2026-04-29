@@ -4,4 +4,4 @@ description: Fork the current conversation into a new iTerm2 split pane. Optiona
 allowed-tools: Bash
 ---
 
-Run `~/.claude/skills/fork-split/run.sh 'NAME'` where NAME is the argument the user passed (omit the arg entirely if none was given). Then say `Forked.` — nothing else.
+Run `${CLAUDE_PLUGIN_ROOT}/skills/fork-split/run.sh 'NAME'` where NAME is the argument the user passed (omit the arg entirely if none was given). Then say `Forked.` — nothing else.
