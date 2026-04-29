@@ -783,6 +783,39 @@ def _normalize_tty(tty: str) -> str:
     return "/dev/tty" + t
 
 
+_SHELL_BASENAMES = {"zsh", "bash", "fish", "sh", "tcsh", "csh", "ksh", "dash"}
+
+
+def _tty_at_shell_prompt(tty: str) -> bool:
+    """Return True if the foreground process on `tty` is a login shell.
+
+    macOS marks the foreground process group with `+` in its `stat` column.
+    """
+    norm = (tty or "").replace("/dev/", "").strip()
+    if not norm:
+        return False
+    try:
+        r = subprocess.run(
+            ["ps", "-t", norm, "-o", "stat=,command="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return False
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        stat, cmd = parts
+        if "+" not in stat:
+            continue
+        first = cmd.split()[0] if cmd else ""
+        # Strip leading dash (login shell convention) and any path component.
+        base = first.lstrip("-").rsplit("/", 1)[-1]
+        if base in _SHELL_BASENAMES:
+            return True
+    return False
+
+
 def _relative_time(mtime: float) -> str:
     delta = datetime.datetime.now() - datetime.datetime.fromtimestamp(mtime)
     if delta.days >= 1:
@@ -1150,6 +1183,15 @@ async def _do_resume(session_id: str, project_path: str, mode: str = "tab") -> b
     app = await _refresh_app()
     cmd = f"cd {shlex.quote(project_path)} && claude --resume {session_id}\n"
 
+    if mode == "here":
+        win = app.current_terminal_window
+        sess = win.current_tab.current_session if (win and win.current_tab) else None
+        if not sess:
+            return False
+        await sess.async_send_text(cmd)
+        await sess.async_activate(select_tab=True, order_window_front=True)
+        return True
+
     if mode == "split":
         win = app.current_window
         src = win.current_tab.current_session if win and win.current_tab else None
@@ -1280,10 +1322,17 @@ class _Handler(BaseHTTPRequestHandler):
             for p in projects:
                 _collect(p.get("sessions") or [])
                 _collect(p.get("archived") or [])
+            # The "Use focused pane" resume option is offered only when the
+            # focused pane is empty (no claude session) AND its foreground
+            # process is a shell waiting for input.
+            focused_pane_available = bool(
+                focused_tty and not focused_sid and _tty_at_shell_prompt(focused_tty)
+            )
             self._send_json({
                 "projects": projects,
                 "current_window_session_ids": current_sids,
                 "focused_session_id": focused_sid,
+                "focused_pane_available": focused_pane_available,
             })
         else:
             self.send_response(404)
@@ -1451,12 +1500,16 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .sess.teammate:hover{background:#231b2c}
 .sess.teammate.open{border-left-color:#4ec9b0;box-shadow:inset 2px 0 #b480e6}
 .sess.teammate.working{border-left-color:#e6b450;box-shadow:inset 2px 0 #b480e6}
-.sess.focused{background:#1a2930 !important;border-left-color:#4fc3f7 !important;border-left-width:3px;padding-left:5px;box-shadow:0 0 0 1px rgba(79,195,247,.3) inset}
+.sess.focused{background:#1a2930 !important;border-left-color:#4fc3f7 !important;border-left-width:3px;padding-left:5px}
 .sess.focused:hover{background:#1f3040 !important}
 .sess.focused .lbl{color:#cfe8ff}
-.sess.teammate.focused{background:#2a1d3d !important;box-shadow:0 0 0 1px rgba(180,128,230,.35) inset}
+.sess.teammate.focused{background:#2a1d3d !important}
 .sess.teammate.focused:hover{background:#331f4a !important}
 .sess.teammate.focused .lbl{color:#e8d9f7}
+/* The focus tint should highlight the session's own row only, not its
+   nested children — paint the children container with the page bg so it
+   covers the parent's tint behind it. */
+.sess.focused > .children{background:#1a1a1a}
 .sess.archived-item{opacity:.5;border-left-color:#333}
 .sess.archived-item .lbl{color:#555}
 
@@ -1522,6 +1575,8 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .resume-menu{position:fixed;background:#252525;border:1px solid #3a3a3a;border-radius:4px;padding:3px 0;z-index:9999;min-width:120px;box-shadow:0 4px 14px rgba(0,0,0,.6)}
 .resume-opt{padding:5px 12px;font-size:11px;color:#bbb;cursor:pointer;white-space:nowrap}
 .resume-opt:hover{background:#333;color:#fff}
+.resume-opt.disabled{color:#555;cursor:not-allowed}
+.resume-opt.disabled:hover{background:transparent;color:#555}
 .arch-chv{font-size:9px;transition:transform .1s;display:inline-block}
 .arch-row.open .arch-chv{transform:rotate(90deg)}
 
@@ -1542,6 +1597,7 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 let data = [];
 let currentSids = new Set();
 let focusedSid = '';
+let focusedPaneAvailable = false;
 
 // Braille spinner — animated locally so the bar doesn't refetch every 80ms.
 const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
@@ -1556,6 +1612,7 @@ setInterval(() => {
 let manualCollapseToggle = new Set(JSON.parse(sessionStorage.getItem('cc_toggle')||'[]'));
 let expandedArchived = new Set();
 let isDragging = false;
+let isEditing = false;
 let _maxWeight = 1;
 const projSortables = {};
 let _tip = null;
@@ -1626,18 +1683,19 @@ function x(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 let _loadInFlight = false;
 let _loadQueued = false;
 async function doLoad(){
-  if(isDragging) return;
+  if(isDragging || isEditing) return;
   if(_loadInFlight){ _loadQueued = true; return; }
   _loadInFlight = true;
   try{
     const r=await fetch('/api/data');
     const payload=await r.json();
     // Payload was wrapped to carry current-window context; stay compatible with the old shape too.
-    if (Array.isArray(payload)) { data = payload; currentSids = new Set(); focusedSid = ''; }
+    if (Array.isArray(payload)) { data = payload; currentSids = new Set(); focusedSid = ''; focusedPaneAvailable = false; }
     else {
       data = payload.projects || [];
       currentSids = new Set(payload.current_window_session_ids || []);
       focusedSid = payload.focused_session_id || '';
+      focusedPaneAvailable = !!payload.focused_pane_available;
     }
     render();
   }catch{
@@ -1673,7 +1731,7 @@ function saveProjectOrder(){
 
 // ── render ────────────────────────────────────────────────────────────────────
 function render(){
-  if(isDragging) return;
+  if(isDragging || isEditing) return;
   Object.keys(projSortables).forEach(e=>destroySortables(e));
   if(_projSortable){_projSortable.destroy();_projSortable=null;}
   _maxWeight=computeMaxWeight(data);
@@ -1962,19 +2020,30 @@ function resumeEl(btn){
   const el=btn.closest('.sess');
   const menu=document.createElement('div');
   menu.id='resume-menu';menu.className='resume-menu';
-  const opts=[{l:'Split pane',m:'split'},{l:'New tab',m:'tab'},{l:'New window',m:'window'}];
+  const opts=[
+    {l:'Use focused pane',m:'here',disabled:!focusedPaneAvailable,
+     reason:'Focused pane already has a session or is busy'},
+    {l:'Split pane',m:'split'},
+    {l:'New tab',m:'tab'},
+    {l:'New window',m:'window'},
+  ];
   for(const o of opts){
     const item=document.createElement('div');
-    item.className='resume-opt';item.textContent=o.l;
-    item.onclick=async()=>{
-      menu.remove();
-      btn.textContent='…';btn.disabled=true;
-      await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:el.dataset.id,project_path:el.dataset.path,mode:o.m})});
-      // Claude can take several seconds to start and register its PID
-      setTimeout(doLoad,3000);
-      setTimeout(doLoad,7000);
-      setTimeout(doLoad,13000);
-    };
+    item.className='resume-opt'+(o.disabled?' disabled':'');
+    item.textContent=o.l;
+    if(o.disabled){
+      if(o.reason) item.title=o.reason;
+    } else {
+      item.onclick=async()=>{
+        menu.remove();
+        btn.textContent='…';btn.disabled=true;
+        await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:el.dataset.id,project_path:el.dataset.path,mode:o.m})});
+        // Claude can take several seconds to start and register its PID
+        setTimeout(doLoad,3000);
+        setTimeout(doLoad,7000);
+        setTimeout(doLoad,13000);
+      };
+    }
     menu.appendChild(item);
   }
   const r=btn.getBoundingClientRect();
@@ -1993,7 +2062,11 @@ function renEl(lbl){
   const inp=document.createElement('input');
   inp.className='lbl-inp';inp.value=cur;inp.placeholder='Label…';
   lbl.replaceWith(inp);inp.focus();inp.select();
+  isEditing=true;
+  let finished=false;
+  const finish=()=>{ if(!finished){ finished=true; isEditing=false; doLoad(); } };
   const commit=async()=>{
+    if(finished) return;
     const v=inp.value.trim();
     const span=document.createElement('span');
     const recap=lbl.dataset.recap||'';
@@ -2011,10 +2084,14 @@ function renEl(lbl){
     if(recap) span.dataset.recap=recap;
     if(def) span.dataset.default=def;
     inp.replaceWith(span);
+    finish();
     await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,encoded_name:enc,label:v})});
   };
   inp.onblur=commit;
-  inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inp.blur();}if(e.key==='Escape'){inp.replaceWith(lbl);}};
+  inp.onkeydown=e=>{
+    if(e.key==='Enter'){e.preventDefault();inp.blur();}
+    if(e.key==='Escape'){inp.replaceWith(lbl); finish();}
+  };
 }
 
 async function archiveEl(btn,sid,enc){
