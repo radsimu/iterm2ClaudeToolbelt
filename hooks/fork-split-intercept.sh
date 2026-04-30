@@ -4,7 +4,16 @@
 # This prevents Claude from making a response turn, so Stop hooks never fire.
 
 INPUT=$(cat)
-MSG=$(echo "$INPUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('message','').strip())" 2>/dev/null)
+# UserPromptSubmit payload: {"prompt": "...", "session_id": ..., ...}.
+# Older versions used "message"; accept either to stay compatible.
+MSG=$(echo "$INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print((d.get('prompt') or d.get('message') or '').strip())
+" 2>/dev/null)
 
 if [[ "$MSG" != /fork-split* ]]; then
   exit 0
