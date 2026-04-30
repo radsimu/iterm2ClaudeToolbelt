@@ -220,6 +220,21 @@ def _refresh_teams_index(session_files: list) -> dict:
     return team_to_leader
 
 
+def _model_max_context(model: str, peak_input_tokens: int = 0) -> int:
+    """Best-effort max-context-window for a Claude model.
+
+    Most current Claude models default to 200K. The 1M-context variants carry a
+    `[1m]` suffix in the id, but Claude Code strips it before writing to the
+    JSONL — so the only reliable signal for 1M mode is observed usage. If the
+    session ever exceeded 200K input tokens, it has to be running in 1M mode.
+    """
+    if "[1m]" in (model or ""):
+        return 1_000_000
+    if peak_input_tokens > 200_000:
+        return 1_000_000
+    return 200_000
+
+
 def _refresh_weights_index(session_files: list) -> dict:
     """session_files: list of (sid, jsonl_path, mtime). Returns {sid: weight_dict}.
 
@@ -239,13 +254,26 @@ def _refresh_weights_index(session_files: list) -> dict:
         except Exception:
             continue
         prev = cache.get(sid) or {}
-        if prev.get("mtime") == mtime and prev.get("size") == size:
+        # Force a full rescan for entries written before we started tracking
+        # current_input_tokens / model — those need to be backfilled.
+        needs_backfill = ("current_input_tokens" not in prev) or ("model" not in prev)
+        if not needs_backfill and prev.get("mtime") == mtime and prev.get("size") == size:
             continue
 
-        start_offset = prev.get("last_offset", 0)
-        output_tokens = prev.get("output_tokens", 0)
-        max_input_tokens = prev.get("max_input_tokens", 0)
-        compactions = prev.get("compactions", 0)
+        if needs_backfill:
+            start_offset = 0
+            output_tokens = 0
+            max_input_tokens = 0
+            compactions = 0
+            current_input_tokens = 0
+            model = ""
+        else:
+            start_offset = prev.get("last_offset", 0)
+            output_tokens = prev.get("output_tokens", 0)
+            max_input_tokens = prev.get("max_input_tokens", 0)
+            compactions = prev.get("compactions", 0)
+            current_input_tokens = prev.get("current_input_tokens", 0)
+            model = prev.get("model", "")
 
         # If the file is smaller than our last offset, it was truncated/replaced — restart.
         if size < start_offset:
@@ -253,6 +281,8 @@ def _refresh_weights_index(session_files: list) -> dict:
             output_tokens = 0
             max_input_tokens = 0
             compactions = 0
+            current_input_tokens = 0
+            model = ""
 
         try:
             with jf.open("rb") as fh:
@@ -278,7 +308,8 @@ def _refresh_weights_index(session_files: list) -> dict:
                 t = d.get("type")
                 if t == "compact_boundary" or d.get("subtype") == "compact_boundary":
                     compactions += 1
-                u = (d.get("message") or {}).get("usage") or {}
+                msg = d.get("message") or {}
+                u = msg.get("usage") or {}
                 if u:
                     output_tokens += int(u.get("output_tokens") or 0)
                     itok = (int(u.get("input_tokens") or 0)
@@ -286,6 +317,14 @@ def _refresh_weights_index(session_files: list) -> dict:
                             + int(u.get("cache_creation_input_tokens") or 0))
                     if itok > max_input_tokens:
                         max_input_tokens = itok
+                    # current_input_tokens / model only update on real assistant
+                    # records; <synthetic> ones (and tool wrappers) don't reflect
+                    # the actual context size of the next user-facing turn.
+                    if t == "assistant":
+                        m = msg.get("model") or ""
+                        if m and m != "<synthetic>":
+                            current_input_tokens = itok
+                            model = m
 
         cache[sid] = {
             "mtime": mtime,
@@ -294,6 +333,8 @@ def _refresh_weights_index(session_files: list) -> dict:
             "output_tokens": output_tokens,
             "max_input_tokens": max_input_tokens,
             "compactions": compactions,
+            "current_input_tokens": current_input_tokens,
+            "model": model,
         }
         changed = True
 
@@ -911,6 +952,9 @@ def build_projects() -> list:
                 "output_tokens": 0,
                 "max_input_tokens": 0,
                 "compactions": 0,
+                "current_input_tokens": 0,
+                "model": "",
+                "max_context": 200000,
                 "children": [],
             })
             session_index_input.append((sid, jf, proj_dir.name, mtime, is_teammate))
@@ -967,6 +1011,9 @@ def build_projects() -> list:
                 "output_tokens": 0,
                 "max_input_tokens": 0,
                 "compactions": 0,
+                "current_input_tokens": 0,
+                "model": "",
+                "max_context": 200000,
                 "children": [],
             })
             known_sids.add(sid)
@@ -982,6 +1029,9 @@ def build_projects() -> list:
             s["output_tokens"] = int(w.get("output_tokens") or 0)
             s["max_input_tokens"] = int(w.get("max_input_tokens") or 0)
             s["compactions"] = int(w.get("compactions") or 0)
+            s["current_input_tokens"] = int(w.get("current_input_tokens") or 0)
+            s["model"] = w.get("model") or ""
+            s["max_context"] = _model_max_context(s["model"], s["max_input_tokens"])
 
     # Teammate map (team_name, agent_name) → most-recent sid. Used by process scanner
     # to pin a running teammate process directly to its session without mtime heuristics.
@@ -1613,7 +1663,6 @@ let manualCollapseToggle = new Set(JSON.parse(sessionStorage.getItem('cc_toggle'
 let expandedArchived = new Set();
 let isDragging = false;
 let isEditing = false;
-let _maxWeight = 1;
 const projSortables = {};
 let _tip = null;
 let _tipTarget = null;
@@ -1631,13 +1680,6 @@ function projHasCurrent(p){
 function isProjCollapsed(enc, hasCurrent){
   const defaultCollapsed = !hasCurrent;
   return manualCollapseToggle.has(enc) ? !defaultCollapsed : defaultCollapsed;
-}
-
-function computeMaxWeight(projects){
-  let m = 1;
-  const walk = (ss) => { for (const s of ss||[]) { if ((s.output_tokens||0) > m) m = s.output_tokens; walk(s.children); } };
-  for (const p of projects||[]) { walk(p.sessions); walk(p.archived); }
-  return m;
 }
 
 function fmtInt(n){ if(!n) return '0'; if(n>=1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M'; if(n>=1e3) return (n/1e3).toFixed(1).replace(/\.0$/,'')+'k'; return String(n); }
@@ -1734,7 +1776,6 @@ function render(){
   if(isDragging || isEditing) return;
   Object.keys(projSortables).forEach(e=>destroySortables(e));
   if(_projSortable){_projSortable.destroy();_projSortable=null;}
-  _maxWeight=computeMaxWeight(data);
   const q=document.getElementById('search').value.toLowerCase();
   const root=document.getElementById('root');
   const scrollY=root.scrollTop;
@@ -1891,16 +1932,26 @@ function makeSessEl(s, p){
     const tip=remote?`Team "${s.team_name}" — leader in another project`:`Team: ${s.team_name}`;
     teamBadge=`<span class="team-badge${remote?' remote':''}" title="${x(tip)}">⇌ ${x(s.team_name)}</span>`;
   }
+  // Context-pressure bar: how full the model's context window is right now.
+  // Linear: current_input_tokens / max_context.
   let weightBar='';
-  const w=s.output_tokens||0;
-  if(w>0||s.compactions>0){
-    const frac=Math.min(1, Math.log(1+w)/Math.log(1+Math.max(_maxWeight,2)));
+  const ctx=s.current_input_tokens||0;
+  const maxCtx=s.max_context||200000;
+  if(ctx>0||s.compactions>0||s.output_tokens>0){
+    const frac=maxCtx>0?Math.min(1, ctx/maxCtx):0;
     const pct=Math.max(4, Math.round(frac*100));
     let cls='';
-    if(frac>=0.9) cls=' w-xxl';
-    else if(frac>=0.6) cls=' w-hi';
-    else if(frac>=0.3) cls=' w-med';
-    const tip=`${fmtInt(w)} output tokens · peak ${fmtInt(s.max_input_tokens||0)} input · ${s.compactions||0} compaction${s.compactions===1?'':'s'}`;
+    if(frac>=0.85) cls=' w-xxl';
+    else if(frac>=0.60) cls=' w-hi';
+    else if(frac>=0.30) cls=' w-med';
+    const tipLines=[
+      `Context: ${fmtInt(ctx)} / ${fmtInt(maxCtx)} (${Math.round(frac*100)}%)`,
+    ];
+    if(s.model) tipLines.push(`Model: ${s.model}`);
+    tipLines.push(`Total output: ${fmtInt(s.output_tokens||0)}`);
+    tipLines.push(`Peak input: ${fmtInt(s.max_input_tokens||0)}`);
+    tipLines.push(`Compactions: ${s.compactions||0}`);
+    const tip=tipLines.join('\n');
     weightBar=`<span class="weight-bar" title="${x(tip)}"><span class="weight-fill${cls}" style="width:${pct}%"></span></span>`;
     if(s.compactions>0){
       weightBar+=`<span class="compact-mark" title="${s.compactions} compaction${s.compactions===1?'':'s'}">↺${s.compactions}</span>`;
