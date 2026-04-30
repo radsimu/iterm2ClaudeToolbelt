@@ -1,6 +1,6 @@
 # iterm2ClaudeToolbelt
 
-An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Code](https://claude.ai/code) sessions — across every project — without leaving your terminal. The repo also doubles as a Claude Code marketplace and ships a bundled [`/fork-split`](#optional-install-the-bundled-fork-split-skill) skill.
+An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Code](https://claude.ai/code) sessions — across every project — without leaving your terminal. The repo also doubles as a Claude Code marketplace and ships a pair of bundled skills, [`/fork-split` and `/fold-back`](#optional-install-the-bundled-fork-split--fold-back-skills), for fork-and-rejoin workflows across iTerm2 panes.
 
 ![iTerm2 with 4 active Claude Code sessions and the toolbelt widget](screenshots/iterm_composite.png)
 
@@ -115,6 +115,8 @@ The repo ships two Claude Code skills that work together:
 
 - **`/fork-split [name]`** — forks the current conversation into a new iTerm2 split pane (mirroring teammate-spawn layout). When the toolbelt is running, the fork is auto-nested under its parent in the widget tree.
 - **`/fold-back`** (run from inside a fork) — instructs Claude to write a concise digest of what the fork concluded, then routes that digest back into the parent's pane and exits the fork. Use it when you took a detour to clarify or investigate something and want the conclusions in the main conversation without the tool-call noise.
+
+> **When to use what.** `/fork-split` + `/fold-back` is the cross-pane play: split off, explore, fold the digest back. If you took a detour but stayed in **one pane**, you don't need a fork — Claude Code's native `Esc + Esc → Summarize from here` already collapses any tail of messages into a summary in place.
 
 This repo doubles as a Claude Code marketplace, so the skills install and update through Claude's native `/plugin` system — no symlinks, no `git pull` cron, no settings.json hacks. Inside any Claude Code session:
 
