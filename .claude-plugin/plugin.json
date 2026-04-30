@@ -1,12 +1,12 @@
 {
   "name": "fork-split",
-  "description": "Fork the current Claude Code conversation into a new iTerm2 split pane. Mirrors teammate-spawn layout, and auto-nests the new session under its parent in the iterm2ClaudeToolbelt widget when present.",
-  "version": "1.0.0",
+  "description": "Two iTerm2-aware Claude Code skills: /fork-split forks the current conversation into a new split pane (auto-nested in the iterm2ClaudeToolbelt widget), and /fold-back summarizes a fork and routes the digest back into the parent before closing the fork.",
+  "version": "1.1.0",
   "author": {
     "name": "Radu Simionescu",
     "url": "https://github.com/radsimu"
   },
   "homepage": "https://github.com/radsimu/iterm2ClaudeToolbelt",
   "license": "MIT",
-  "keywords": ["iterm2", "fork", "split-pane", "session-management"]
+  "keywords": ["iterm2", "fork", "fold-back", "split-pane", "session-management"]
 }

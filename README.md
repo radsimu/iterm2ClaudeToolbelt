@@ -22,7 +22,7 @@ An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Cod
 - **Worktree indicator** — marks sessions running in a git worktree
 - **Session status** — colour-coded dot: green = open in iTerm2, amber = working, grey = idle
 - **Dark-mode native** — designed for iTerm2's dark theme
-- **Bundled `/fork-split` skill** — installable through Claude Code's plugin marketplace; forks the current conversation into a new iTerm2 split pane and (when the toolbelt is running) auto-nests the new session under its parent in the widget tree
+- **Bundled `/fork-split` + `/fold-back` skills** — installable through Claude Code's plugin marketplace. `/fork-split` forks the current conversation into a new iTerm2 split pane (auto-nested in the widget tree); `/fold-back` summarizes the fork's conclusions, routes the digest back into the parent conversation, and closes the fork pane.
 
 | Widget overview | Recap tooltip on hover | Resume options |
 |---|---|---|
@@ -109,11 +109,14 @@ The widget appears in the right-hand toolbelt panel.
 
 ---
 
-## Optional: install the bundled `/fork-split` skill
+## Optional: install the bundled `/fork-split` + `/fold-back` skills
 
-The repo also ships a small Claude Code skill, `/fork-split`, that forks the current conversation into a new iTerm2 split pane (mirroring teammate-spawn layout). If the toolbelt is installed, the fork is auto-nested under its parent in the widget tree.
+The repo ships two Claude Code skills that work together:
 
-This repo doubles as a Claude Code marketplace, so the skill installs and updates through Claude's native `/plugin` system — no symlinks, no `git pull` cron, no settings.json hacks. Inside any Claude Code session:
+- **`/fork-split [name]`** — forks the current conversation into a new iTerm2 split pane (mirroring teammate-spawn layout). When the toolbelt is running, the fork is auto-nested under its parent in the widget tree.
+- **`/fold-back`** (run from inside a fork) — instructs Claude to write a concise digest of what the fork concluded, then routes that digest back into the parent's pane and exits the fork. Use it when you took a detour to clarify or investigate something and want the conclusions in the main conversation without the tool-call noise.
+
+This repo doubles as a Claude Code marketplace, so the skills install and update through Claude's native `/plugin` system — no symlinks, no `git pull` cron, no settings.json hacks. Inside any Claude Code session:
 
 ```
 /plugin marketplace add radsimu/iterm2ClaudeToolbelt
@@ -122,7 +125,7 @@ This repo doubles as a Claude Code marketplace, so the skill installs and update
 
 The marketplace entry tracks `main` and Claude Code refreshes it automatically. Updates land next time you start a session.
 
-`/fork-split` requires `python3` with `iterm2` installed (`pip install iterm2`). To pin a specific interpreter, set `CLAUDE_FORK_SPLIT_PYTHON=/path/to/python3` in your shell profile.
+Both skills require `python3` with `iterm2` installed (`pip install iterm2`). To pin a specific interpreter, set `CLAUDE_FORK_SPLIT_PYTHON=/path/to/python3` (or `CLAUDE_FOLD_BACK_PYTHON`) in your shell profile.
 
 To uninstall:
 

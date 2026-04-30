@@ -9,10 +9,10 @@
     {
       "name": "fork-split",
       "source": "./",
-      "description": "Fork the current Claude Code conversation into a new iTerm2 split pane.",
-      "version": "1.0.0",
+      "description": "iTerm2-aware Claude Code skills: /fork-split forks into a new pane; /fold-back digests a fork back into the parent and closes it.",
+      "version": "1.1.0",
       "category": "utility",
-      "tags": ["iterm2", "fork", "split-pane"]
+      "tags": ["iterm2", "fork", "fold-back", "split-pane"]
     }
   ]
 }
