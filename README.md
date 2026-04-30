@@ -1,6 +1,6 @@
 # iterm2ClaudeToolbelt
 
-An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Code](https://claude.ai/code) sessions — across every project — without leaving your terminal.
+An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Code](https://claude.ai/code) sessions — across every project — without leaving your terminal. The repo also doubles as a Claude Code marketplace and ships a bundled [`/fork-split`](#optional-install-the-bundled-fork-split-skill) skill.
 
 ![iTerm2 with 4 active Claude Code sessions and the toolbelt widget](screenshots/iterm_composite.png)
 
@@ -22,6 +22,7 @@ An iTerm2 toolbelt widget that gives you a live overview of all your [Claude Cod
 - **Worktree indicator** — marks sessions running in a git worktree
 - **Session status** — colour-coded dot: green = open in iTerm2, amber = working, grey = idle
 - **Dark-mode native** — designed for iTerm2's dark theme
+- **Bundled `/fork-split` skill** — installable through Claude Code's plugin marketplace; forks the current conversation into a new iTerm2 split pane and (when the toolbelt is running) auto-nests the new session under its parent in the widget tree
 
 | Widget overview | Recap tooltip on hover | Resume options |
 |---|---|---|
@@ -129,21 +130,6 @@ To uninstall:
 /plugin uninstall fork-split@iterm2-claude-toolbelt
 /plugin marketplace remove iterm2-claude-toolbelt
 ```
-
-<details>
-<summary>Manual / advanced install (symlinks instead of plugin)</summary>
-
-If you'd rather keep the skill as editable symlinks pointing into a local clone of the repo (handy when you're hacking on it):
-
-```bash
-./install-skills.sh                  # symlink skills + hooks into ~/.claude/
-./install-skills.sh --auto-update    # also install a daily `git pull` LaunchAgent
-./install-skills.sh --uninstall
-```
-
-You'll need to wire the optional `UserPromptSubmit` interceptor by hand — the script prints the snippet to add to `~/.claude/settings.json`.
-
-</details>
 
 ---
 
