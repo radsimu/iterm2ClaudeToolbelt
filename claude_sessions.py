@@ -1046,17 +1046,46 @@ def build_projects() -> list:
                     teammate_map[key] = s["id"]
 
     # Phase 2b — scan live claude processes and apply tty/status to each session.
-    # Status: "inactive" (no claude process), "working" (something pending in JSONL),
+    # Status: "inactive" (no claude process), "working" (something in flight),
     # or "idle" (process alive, last assistant turn ended).
+    #
+    # Primary signal is the `status: busy|idle` field Claude Code itself writes
+    # to ~/.claude/sessions/<pid>.json — that's authoritative. The JSONL tail
+    # classifier remains as a fallback for older Claude Code versions and for
+    # edge cases (e.g. an orphan prompt left after a rewind glitch where the
+    # JSONL ends with an unanswered user message but the model isn't actually
+    # working).
     session_tty = _get_active_session_ttys(teammate_map)
+    pid_status: dict = {}
+    sessions_dir = CLAUDE_DIR / "sessions"
+    if sessions_dir.exists():
+        try:
+            for pf in sessions_dir.iterdir():
+                if pf.suffix != ".json":
+                    continue
+                try:
+                    pdata = json.loads(pf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                sid = pdata.get("sessionId")
+                st = pdata.get("status") or ""
+                if sid and st:
+                    pid_status[sid] = st
+        except Exception:
+            pass
     for _, _, flat in phase1:
         for s in flat:
             tty = session_tty.get(s["id"], "")
             s["tty"] = tty
             s["is_open"] = bool(tty)
             jsonl_working = s.pop("_working_jsonl", False)
+            cc_status = pid_status.get(s["id"], "")
             if not tty:
                 s["status"] = "inactive"
+            elif cc_status == "busy":
+                s["status"] = "working"
+            elif cc_status == "idle":
+                s["status"] = "idle"
             elif jsonl_working:
                 s["status"] = "working"
             else:
