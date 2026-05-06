@@ -514,7 +514,7 @@ def _session_git_info(jf: Path) -> dict:
                 continue
             if t == "assistant":
                 stop = (d.get("message") or {}).get("stop_reason")
-                working = stop not in ("end_turn", "stop_sequence", None)
+                working = bool(stop) and stop not in ("end_turn", "stop_sequence")
                 break
             if t == "user":
                 content = (d.get("message") or {}).get("content")
