@@ -1020,6 +1020,49 @@ def build_projects() -> list:
             session_index_input.append((sid, jf_stub, target_enc, mtime, False))
             weight_input.append((sid, jf_stub, mtime))
 
+    # Phase 1c — dedupe sessions by sid across projects.
+    # Claude Code occasionally writes the same JSONL file under multiple project
+    # dirs (e.g. when the same session was used inside both a worktree and the
+    # parent project). The duplicates would otherwise render side-by-side and
+    # cause the focused-pane highlight to fire on every copy.
+    canonical_enc: dict = {}
+    if sessions_dir.exists():
+        try:
+            for pf in sessions_dir.iterdir():
+                if pf.suffix != ".json":
+                    continue
+                try:
+                    pdata = json.loads(pf.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                psid = pdata.get("sessionId")
+                pcwd = pdata.get("cwd")
+                if psid and pcwd:
+                    canonical_enc[psid] = _encode_project_path(pcwd)
+        except Exception:
+            pass
+
+    winner: dict = {}  # sid -> (enc, mtime)
+    for enc, _, flat in phase1:
+        for s in flat:
+            sid = s["id"]
+            cur = winner.get(sid)
+            if cur is None:
+                winner[sid] = (enc, s["mtime"])
+                continue
+            cur_enc, cur_mtime = cur
+            canon = canonical_enc.get(sid)
+            if canon and enc == canon and cur_enc != canon:
+                winner[sid] = (enc, s["mtime"])
+            elif canon and cur_enc == canon:
+                pass  # incumbent is canonical, keep it
+            elif s["mtime"] > cur_mtime:
+                winner[sid] = (enc, s["mtime"])
+    for enc, _, flat in phase1:
+        flat[:] = [s for s in flat if winner.get(s["id"], (None,))[0] == enc]
+    # Drop projects that lost every session to dedupe.
+    phase1[:] = [(enc, pp, flat) for enc, pp, flat in phase1 if flat]
+
     # Phase 2 — resolve team → leader and attach to teammate sessions.
     team_to_leader = _refresh_teams_index(session_index_input)
     weights = _refresh_weights_index(weight_input)
