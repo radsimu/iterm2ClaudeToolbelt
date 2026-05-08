@@ -1101,6 +1101,11 @@ def build_projects() -> list:
     session_tty = _get_active_session_ttys(teammate_map)
     pid_status: dict = {}
     sessions_dir = CLAUDE_DIR / "sessions"
+    # Claude's status field can go stale — claude crashes mid-turn or just stops
+    # heartbeating without resetting `busy`. Trust the field only if it was
+    # written recently; otherwise fall back to the JSONL classifier.
+    _pid_status_max_age_s = 120.0
+    _now_ms = time.time() * 1000
     if sessions_dir.exists():
         try:
             for pf in sessions_dir.iterdir():
@@ -1112,8 +1117,12 @@ def build_projects() -> list:
                     continue
                 sid = pdata.get("sessionId")
                 st = pdata.get("status") or ""
-                if sid and st:
-                    pid_status[sid] = st
+                if not sid or not st:
+                    continue
+                updated = pdata.get("updatedAt") or 0
+                if updated and (_now_ms - updated) / 1000 > _pid_status_max_age_s:
+                    continue  # stale — let JSONL classifier decide
+                pid_status[sid] = st
         except Exception:
             pass
     for _, _, flat in phase1:
