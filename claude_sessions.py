@@ -1840,6 +1840,9 @@ function connectEvents(){
     setTimeout(connectEvents, 3000);
   };
 }
+// Fire one load immediately so we don't sit on "Loading…" until SSE wires up
+// (or until the 30s safety-net poll kicks in if SSE never connects at all).
+doLoad();
 connectEvents();
 // Slow safety-net poll in case the SSE stream silently stalls.
 setInterval(doLoad, 30000);
@@ -2425,12 +2428,15 @@ async def main(connection: iterm2.Connection) -> None:
     _connection = connection
     _event_loop = asyncio.get_running_loop()
 
+    # Use the literal IPv4 address rather than `localhost`. macOS resolves
+    # `localhost` to both ::1 and 127.0.0.1 with IPv6 first; WKWebView tries
+    # IPv6, gets ECONNREFUSED (we only bind v4), and hangs / shows blank.
     await iterm2.tool.async_register_web_view_tool(
         connection=connection,
         display_name="Claude Sessions",
         identifier=IDENTIFIER,
         reveal_if_already_registered=False,
-        url=f"http://localhost:{PORT}/",
+        url=f"http://127.0.0.1:{PORT}/",
     )
 
     t = threading.Thread(target=_start_server, daemon=True, name="claude-sessions-http")
