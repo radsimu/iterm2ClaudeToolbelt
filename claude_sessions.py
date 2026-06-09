@@ -366,6 +366,10 @@ def _build_tree(order_nodes, sess_map) -> list:
         sid = node if isinstance(node, str) else node["id"]
         child_nodes = [] if isinstance(node, str) else node.get("children", [])
         if sid not in sess_map:
+            # Parent's JSONL no longer exists (deleted / moved). Don't lose
+            # its live children — promote them up to the current level.
+            if child_nodes:
+                result.extend(_build_tree(child_nodes, sess_map))
             continue
         s = sess_map[sid].copy()
         s["children"] = _build_tree(child_nodes, sess_map)
