@@ -88,8 +88,23 @@ escaped_cwd = session_cwd.replace("'", "'\"'\"'")
 extra        = (' ' + ' '.join(extra_flags)) if extra_flags else ''
 cmd = f"cd '{escaped_cwd}' && claude --resume {session_id} --fork-session{extra}"
 if FORK_NAME:
-    escaped_name = FORK_NAME.replace("'", "'\"'\"'")
-    cmd += f" -n '{escaped_name}'"
+    # The arg is the fork's SEED PROMPT (what the new session should start doing),
+    # not just a display title. Two parts:
+    #   -n <short title>   → display name (first line, trimmed)
+    #   positional prompt  → claude runs it as the first user message on startup
+    # A long / multi-line / em-dash prompt typed straight onto the shell line broke
+    # the paste (stray newline → unclosed quote → stuck at a `>` PS2 prompt), so the
+    # full seed is stashed in a temp file and the positional just points at it.
+    import tempfile, time as _time
+    title = (FORK_NAME.strip().splitlines() or [''])[0][:60]
+    esc_title = title.replace("'", "'\"'\"'")
+    cmd += f" -n '{esc_title}'"
+    seed_file = os.path.join(tempfile.gettempdir(), f"claude-fork-seed-{int(_time.time()*1000)}.md")
+    with open(seed_file, 'w') as _sf:
+        _sf.write(FORK_NAME)
+    prompt = f"Your fork seed prompt is in {seed_file} — read it and begin."
+    esc_prompt = prompt.replace("'", "'\"'\"'")
+    cmd += f" '{esc_prompt}'"
 
 # ── Background nest-watcher (only used when the toolbelt is installed) ───────
 # Waits for the fork's JSONL to appear, then rewrites the toolbelt's order file
