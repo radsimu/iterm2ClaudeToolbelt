@@ -1366,14 +1366,35 @@ async def _do_resume(session_id: str, project_path: str, mode: str = "tab") -> b
     return True
 
 
+_iterm_consecutive_failures = 0
+_ITERM_FAILURE_EXIT_THRESHOLD = 12  # ~36s at 3s refresh; long enough to ride out iTerm2 brief hiccups
+
+
 def _run_iterm_op(coro) -> Optional[bool]:
+    """Run a coroutine in the iterm2 event loop. After N consecutive failures
+    (iTerm2 quit / API server gone), sys.exit so launchd respawns us with a
+    fresh connection — the iterm2 module's `retry=True` doesn't reliably
+    recover from a long-gone connection."""
+    global _iterm_consecutive_failures
     if _event_loop is None:
         return None
     future = asyncio.run_coroutine_threadsafe(coro, _event_loop)
     try:
-        return future.result(timeout=10)
+        result = future.result(timeout=10)
+        _iterm_consecutive_failures = 0
+        return result
     except Exception as exc:
-        print(f"[claude-sessions] iTerm2 op error: {exc}", file=sys.stderr)
+        _iterm_consecutive_failures += 1
+        print(
+            f"[claude-sessions] iTerm2 op error ({_iterm_consecutive_failures}/{_ITERM_FAILURE_EXIT_THRESHOLD}): {exc}",
+            file=sys.stderr,
+        )
+        if _iterm_consecutive_failures >= _ITERM_FAILURE_EXIT_THRESHOLD:
+            print(
+                "[claude-sessions] giving up; exiting so launchd respawns with a fresh iTerm2 connection",
+                file=sys.stderr,
+            )
+            os._exit(1)
         return None
 
 
