@@ -1737,6 +1737,8 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
 .arch-row.open .arch-chv{transform:rotate(90deg)}
 
 #empty{text-align:center;color:#555;font-size:11px;margin-top:30px}
+.srch-proj{font-size:9px;color:#569cd6;background:#1a2530;border:1px solid #1e3a50;padding:0 5px 0 4px;border-radius:2px;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:flex-start}
+.srch-sep{height:1px;background:#222;margin:4px 0}
 </style>
 </head>
 <body>
@@ -1745,7 +1747,7 @@ body{background:#1a1a1a;color:#ccc;font:12px/1.5 -apple-system,BlinkMacSystemFon
   <button id="probe-toggle" onclick="toggleProbe()" title="Show iTerm2 window probe">🔍</button>
 </div>
 <div id="probe" style="display:none"></div>
-<input id="search" type="text" placeholder="Filter…" oninput="render()">
+<input id="search" type="text" placeholder="Search…" oninput="render()">
 <div id="root">Loading…</div>
 
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
@@ -1885,10 +1887,16 @@ function render(){
   if(isDragging || isEditing) return;
   Object.keys(projSortables).forEach(e=>destroySortables(e));
   if(_projSortable){_projSortable.destroy();_projSortable=null;}
-  const q=document.getElementById('search').value.toLowerCase();
+  const q=document.getElementById('search').value.toLowerCase().trim();
+  const words=q?q.split(/\s+/).filter(Boolean):[];
   const root=document.getElementById('root');
   const scrollY=root.scrollTop;
   root.innerHTML='';
+  if(words.length){
+    renderSearch(words,root);
+    root.scrollTop=scrollY;
+    return;
+  }
   let any=false;
   // Split: projects whose sessions include one from the frontmost window go first.
   const cur=[], other=[];
@@ -2099,6 +2107,59 @@ function filterTree(sessions, q, projName){
 }
 function hasOpen(sessions){return sessions.some(s=>s.is_open||hasOpen(s.children||[]));}
 function countAll(sessions){return sessions.reduce((n,s)=>n+1+countAll(s.children||[]),0);}
+
+// ── Ranked search ─────────────────────────────────────────────────────────────
+function scoreSession(s, p, words){
+  // Field weights: custom label > default label > project > recap/tooltip > team > branch
+  const fields=[
+    [s.label||'', 100],
+    [s.default_label||'', 80],
+    [p.display_name||'', 60],
+    [s.computed_title||'', 40],
+    [(s.team_name||'')+' '+(s.agent_name||''), 30],
+    [s.branch||'', 20],
+  ];
+  let score=0;
+  for(const w of words){
+    for(const [text, wt] of fields){
+      const t=text.toLowerCase();
+      let cnt=0, pos=0;
+      while((pos=t.indexOf(w,pos))!==-1){cnt++;pos+=w.length;}
+      if(cnt) score+=wt*Math.min(cnt,3);
+    }
+    if(s.id.startsWith(w)) score+=10;
+  }
+  return score;
+}
+
+function flattenTree(sessions){
+  return sessions.flatMap(s=>[s,...flattenTree(s.children||[])]);
+}
+
+function renderSearch(words, root){
+  const results=[];
+  for(const p of data){
+    for(const s of flattenTree(p.sessions||[])){
+      const score=scoreSession(s,p,words);
+      if(score>0) results.push({s,p,score});
+    }
+  }
+  results.sort((a,b)=>b.score-a.score);
+  if(!results.length){root.innerHTML='<div id="empty">No sessions found</div>';return;}
+  let lastProj='';
+  for(const {s,p} of results){
+    if(p.encoded_name!==lastProj){
+      if(lastProj) root.appendChild(Object.assign(document.createElement('div'),{className:'srch-sep'}));
+      lastProj=p.encoded_name;
+    }
+    const el=makeSessEl(s,p);
+    const badge=document.createElement('div');
+    badge.className='srch-proj';
+    badge.textContent=p.display_name;
+    el.prepend(badge);
+    root.appendChild(el);
+  }
+}
 
 // ── SortableJS ────────────────────────────────────────────────────────────────
 function destroySortables(enc){
