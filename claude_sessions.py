@@ -504,6 +504,7 @@ def _session_git_info(jf: Path) -> dict:
             "<command-message>",
             "<command-stdout>",
             "<command-stderr>",
+            "[Request interrupted",   # Escape-key interrupt — session ended cleanly
         )
         for line in reversed(large_tail.splitlines()):
             line = line.strip()
